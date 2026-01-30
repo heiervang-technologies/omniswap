@@ -97,8 +97,13 @@ func NewProcess(ID string, healthCheckTimeout int, config config.ModelConfig, pr
 	if proxyURL != nil {
 		reverseProxy = httputil.NewSingleHostReverseProxy(proxyURL)
 		reverseProxy.ModifyResponse = func(resp *http.Response) error {
-			// prevent nginx from buffering streaming responses (e.g., SSE)
-			if strings.Contains(strings.ToLower(resp.Header.Get("Content-Type")), "text/event-stream") {
+			ct := strings.ToLower(resp.Header.Get("Content-Type"))
+			isSSE := strings.Contains(ct, "text/event-stream")
+			isChunked := len(resp.TransferEncoding) > 0 && resp.TransferEncoding[0] == "chunked"
+
+			// prevent nginx from buffering streaming responses
+			// (SSE for chat completions, chunked audio for TTS, etc.)
+			if isSSE || isChunked {
 				resp.Header.Set("X-Accel-Buffering", "no")
 			}
 			return nil

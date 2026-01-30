@@ -1567,3 +1567,37 @@ models:
 		assert.Equal(t, "no", w.Header().Get("X-Accel-Buffering"))
 	})
 }
+
+func TestShouldCollectMetrics(t *testing.T) {
+	tests := []struct {
+		path     string
+		expected bool
+	}{
+		// LLM endpoints — should collect metrics
+		{"/v1/chat/completions", true},
+		{"/v1/completions", true},
+		{"/v1/embeddings", true},
+		{"/v1/messages", true},
+		{"/v1/messages/count_tokens", true},
+		{"/v1/responses", true},
+		{"/rerank", true},
+		{"/v1/rerank", true},
+		{"/completion", true},
+		{"/infill", true},
+
+		// Audio endpoints — skip metrics (binary audio responses)
+		{"/v1/audio/speech", false},
+		{"/v1/audio/voices", false},
+		{"/v1/audio/transcriptions", false},
+
+		// Image endpoints — skip metrics (large b64 image responses)
+		{"/v1/images/generations", false},
+		{"/v1/images/edits", false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.path, func(t *testing.T) {
+			assert.Equal(t, tt.expected, shouldCollectMetrics(tt.path))
+		})
+	}
+}
