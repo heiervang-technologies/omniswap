@@ -1,0 +1,51 @@
+# omniswap config for vllm-omni backends
+#
+# All models share a single GPU and swap on demand.
+# Only one model is loaded at a time (default group: swap=true, exclusive=true).
+
+healthCheckTimeout: 600
+logLevel: info
+logToStdout: both
+
+models:
+  # Chat / LLM — Qwen2.5-Omni-7B (text + audio output)
+  "qwen2.5-omni":
+    cmd: >
+      vllm serve Qwen/Qwen2.5-Omni-7B
+      --omni
+      --port ${PORT}
+      --host 127.0.0.1
+      --gpu-memory-utilization 0.9
+      --enforce-eager
+      --trust-remote-code
+    proxy: "http://127.0.0.1:${PORT}"
+    aliases:
+      - "gpt-4o"
+
+  # Text-to-Speech — Qwen3-TTS
+  "qwen3-tts":
+    cmd: >
+      vllm serve Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice
+      --omni
+      --port ${PORT}
+      --host 127.0.0.1
+      --gpu-memory-utilization 0.9
+      --enforce-eager
+      --trust-remote-code
+      --stage-configs-path vllm_omni/model_executor/stage_configs/qwen3_tts.yaml
+    proxy: "http://127.0.0.1:${PORT}"
+    aliases:
+      - "tts-1"
+
+  # Image Generation — diffusion model
+  "qwen-image":
+    cmd: >
+      vllm serve Qwen/Qwen-Image
+      --omni
+      --port ${PORT}
+      --host 127.0.0.1
+      --vae-use-slicing
+      --vae-use-tiling
+    proxy: "http://127.0.0.1:${PORT}"
+    aliases:
+      - "dall-e-3"
