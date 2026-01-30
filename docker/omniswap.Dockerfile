@@ -1,3 +1,7 @@
+# Global ARGs — available to all stages
+ARG VLLM_OMNI_IMAGE=vllm-omni-q3tts
+ARG VLLM_OMNI_TAG=latest
+
 # Stage 1: Build omniswap binary
 FROM golang:1.25 AS builder
 
@@ -17,8 +21,6 @@ RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build \
     -o /omniswap
 
 # Stage 2: Runtime — vllm-omni base with omniswap added
-ARG VLLM_OMNI_IMAGE=vllm/vllm-openai
-ARG VLLM_OMNI_TAG=v0.14.0
 FROM ${VLLM_OMNI_IMAGE}:${VLLM_OMNI_TAG}
 
 WORKDIR /app
