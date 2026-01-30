@@ -1,41 +1,63 @@
 # omniswap config for vllm-omni backends
 #
-# All models share a single GPU and swap on demand.
+# All Qwen3-TTS models share a single GPU and swap on demand.
 # Only one model is loaded at a time (default group: swap=true, exclusive=true).
 
 healthCheckTimeout: 600
 logLevel: info
 logToStdout: both
 
+macros:
+  "stage-configs": "/usr/local/lib/python3.12/dist-packages/vllm_omni/model_executor/stage_configs/qwen3_tts.yaml"
+  "vllm-flags": >
+    --omni
+    --host 127.0.0.1
+    --gpu-memory-utilization 0.9
+    --enforce-eager
+    --trust-remote-code
+    --stage-configs-path ${stage-configs}
+
 models:
-  # Qwen3-TTS 1.7B — higher quality, slower
-  "qwen3-tts-1.7b":
+  # 1.7B VoiceDesign — voice design from text descriptions
+  "qwen3-tts-1.7b-voicedesign":
+    cmd: >
+      vllm serve Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign
+      --port ${PORT} ${vllm-flags}
+    proxy: "http://127.0.0.1:${PORT}"
+    useModelName: "Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign"
+
+  # 1.7B CustomVoice — instruction-controlled style with 9 premium timbres
+  "qwen3-tts-1.7b-customvoice":
     cmd: >
       vllm serve Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice
-      --omni
-      --port ${PORT}
-      --host 127.0.0.1
-      --gpu-memory-utilization 0.9
-      --enforce-eager
-      --trust-remote-code
-      --stage-configs-path /usr/local/lib/python3.12/dist-packages/vllm_omni/model_executor/stage_configs/qwen3_tts.yaml
+      --port ${PORT} ${vllm-flags}
     proxy: "http://127.0.0.1:${PORT}"
     useModelName: "Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice"
     aliases:
       - "tts-1-hd"
 
-  # Qwen3-TTS 0.6B — faster, lighter
-  "qwen3-tts-0.6b":
+  # 1.7B Base — 3-second voice clone from audio input
+  "qwen3-tts-1.7b-base":
+    cmd: >
+      vllm serve Qwen/Qwen3-TTS-12Hz-1.7B-Base
+      --port ${PORT} ${vllm-flags}
+    proxy: "http://127.0.0.1:${PORT}"
+    useModelName: "Qwen/Qwen3-TTS-12Hz-1.7B-Base"
+
+  # 0.6B CustomVoice — 9 premium timbres, faster/lighter
+  "qwen3-tts-0.6b-customvoice":
     cmd: >
       vllm serve Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice
-      --omni
-      --port ${PORT}
-      --host 127.0.0.1
-      --gpu-memory-utilization 0.9
-      --enforce-eager
-      --trust-remote-code
-      --stage-configs-path /usr/local/lib/python3.12/dist-packages/vllm_omni/model_executor/stage_configs/qwen3_tts.yaml
+      --port ${PORT} ${vllm-flags}
     proxy: "http://127.0.0.1:${PORT}"
     useModelName: "Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice"
     aliases:
       - "tts-1"
+
+  # 0.6B Base — 3-second voice clone, fastest
+  "qwen3-tts-0.6b-base":
+    cmd: >
+      vllm serve Qwen/Qwen3-TTS-12Hz-0.6B-Base
+      --port ${PORT} ${vllm-flags}
+    proxy: "http://127.0.0.1:${PORT}"
+    useModelName: "Qwen/Qwen3-TTS-12Hz-0.6B-Base"
