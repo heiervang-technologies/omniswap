@@ -1,0 +1,41 @@
+# omniswap config for vllm-omni backends
+#
+# All models share a single GPU and swap on demand.
+# Only one model is loaded at a time (default group: swap=true, exclusive=true).
+
+healthCheckTimeout: 600
+logLevel: info
+logToStdout: both
+
+models:
+  # Qwen3-TTS 1.7B — higher quality, slower
+  "qwen3-tts-1.7b":
+    cmd: >
+      vllm serve Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice
+      --omni
+      --port ${PORT}
+      --host 127.0.0.1
+      --gpu-memory-utilization 0.9
+      --enforce-eager
+      --trust-remote-code
+      --stage-configs-path /usr/local/lib/python3.12/dist-packages/vllm_omni/model_executor/stage_configs/qwen3_tts.yaml
+    proxy: "http://127.0.0.1:${PORT}"
+    useModelName: "Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice"
+    aliases:
+      - "tts-1-hd"
+
+  # Qwen3-TTS 0.6B — faster, lighter
+  "qwen3-tts-0.6b":
+    cmd: >
+      vllm serve Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice
+      --omni
+      --port ${PORT}
+      --host 127.0.0.1
+      --gpu-memory-utilization 0.9
+      --enforce-eager
+      --trust-remote-code
+      --stage-configs-path /usr/local/lib/python3.12/dist-packages/vllm_omni/model_executor/stage_configs/qwen3_tts.yaml
+    proxy: "http://127.0.0.1:${PORT}"
+    useModelName: "Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice"
+    aliases:
+      - "tts-1"

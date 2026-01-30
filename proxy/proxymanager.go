@@ -587,8 +587,8 @@ func (pm *ProxyManager) proxyToUpstream(c *gin.Context) {
 	originalPath := c.Request.URL.Path
 	c.Request.URL.Path = remainingPath
 
-	// attempt to record metrics if it is a POST request
-	if pm.metricsMonitor != nil && c.Request.Method == "POST" {
+	// attempt to record metrics if it is a POST request with parseable responses
+	if pm.metricsMonitor != nil && c.Request.Method == "POST" && shouldCollectMetrics(remainingPath) {
 		if err := pm.metricsMonitor.wrapHandler(modelID, c.Writer, c.Request, processGroup.ProxyRequest); err != nil {
 			pm.sendErrorResponse(c, http.StatusInternalServerError, fmt.Sprintf("error proxying metrics wrapped request: %s", err.Error()))
 			pm.proxyLogger.Errorf("Error proxying wrapped upstream request for model %s, path=%s", modelID, originalPath)
@@ -715,7 +715,7 @@ func (pm *ProxyManager) proxyInferenceHandler(c *gin.Context) {
 	ctx = context.WithValue(ctx, proxyCtxKey("model"), modelID)
 	c.Request = c.Request.WithContext(ctx)
 
-	if pm.metricsMonitor != nil && c.Request.Method == "POST" {
+	if pm.metricsMonitor != nil && c.Request.Method == "POST" && shouldCollectMetrics(c.Request.URL.Path) {
 		if err := pm.metricsMonitor.wrapHandler(modelID, c.Writer, c.Request, nextHandler); err != nil {
 			pm.sendErrorResponse(c, http.StatusInternalServerError, fmt.Sprintf("error proxying metrics wrapped request: %s", err.Error()))
 			pm.proxyLogger.Errorf("Error Proxying Metrics Wrapped Request model %s", modelID)
@@ -965,4 +965,19 @@ func (pm *ProxyManager) SetVersion(buildDate string, commit string, version stri
 	pm.buildDate = buildDate
 	pm.commit = commit
 	pm.version = version
+}
+
+// shouldCollectMetrics returns true if the request path is expected to return
+// token-level metrics in the response body. Paths that return binary data
+// (audio) or non-LLM responses (images) are excluded to avoid buffering
+// large non-parseable response bodies in memory.
+func shouldCollectMetrics(path string) bool {
+	switch {
+	case strings.HasPrefix(path, "/v1/audio/"):
+		return false
+	case strings.HasPrefix(path, "/v1/images/"):
+		return false
+	default:
+		return true
+	}
 }
