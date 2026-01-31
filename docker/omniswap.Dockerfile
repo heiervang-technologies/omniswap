@@ -27,6 +27,7 @@ WORKDIR /app
 
 COPY --from=builder /omniswap /app/omniswap
 COPY docker/omniswap-config.example.yaml /app/config.yaml
+COPY docker/stage-configs/ /app/stage-configs/
 
 ENV PATH="/app:${PATH}"
 
