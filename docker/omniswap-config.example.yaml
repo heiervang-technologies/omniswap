@@ -1,6 +1,6 @@
 # omniswap config for vllm-omni backends
 #
-# All Qwen3-TTS models share a single GPU and swap on demand.
+# All models share GPUs and swap on demand.
 # Only one model is loaded at a time (default group: swap=true, exclusive=true).
 
 healthCheckTimeout: 600
@@ -8,21 +8,25 @@ logLevel: info
 logToStdout: both
 
 macros:
-  "stage-configs": "/usr/local/lib/python3.12/dist-packages/vllm_omni/model_executor/stage_configs/qwen3_tts.yaml"
-  "vllm-flags": >
+  "sc": "/app/stage-configs"
+  "vllm-base": >
     --omni
     --host 127.0.0.1
-    --gpu-memory-utilization 0.9
     --enforce-eager
     --trust-remote-code
-    --stage-configs-path ${stage-configs}
 
 models:
+  # ---------------------------------------------------------------------------
+  # Qwen3-TTS — text-to-speech (single GPU)
+  # ---------------------------------------------------------------------------
+
   # 1.7B VoiceDesign — voice design from text descriptions
   "qwen3-tts-1.7b-voicedesign":
     cmd: >
       vllm serve Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign
-      --port ${PORT} ${vllm-flags}
+      --port ${PORT} ${vllm-base}
+      --gpu-memory-utilization 0.9
+      --stage-configs-path ${sc}/qwen3_tts.yaml
     proxy: "http://127.0.0.1:${PORT}"
     useModelName: "Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign"
 
@@ -30,7 +34,9 @@ models:
   "qwen3-tts-1.7b-customvoice":
     cmd: >
       vllm serve Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice
-      --port ${PORT} ${vllm-flags}
+      --port ${PORT} ${vllm-base}
+      --gpu-memory-utilization 0.9
+      --stage-configs-path ${sc}/qwen3_tts.yaml
     proxy: "http://127.0.0.1:${PORT}"
     useModelName: "Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice"
     aliases:
@@ -40,7 +46,9 @@ models:
   "qwen3-tts-1.7b-base":
     cmd: >
       vllm serve Qwen/Qwen3-TTS-12Hz-1.7B-Base
-      --port ${PORT} ${vllm-flags}
+      --port ${PORT} ${vllm-base}
+      --gpu-memory-utilization 0.9
+      --stage-configs-path ${sc}/qwen3_tts.yaml
     proxy: "http://127.0.0.1:${PORT}"
     useModelName: "Qwen/Qwen3-TTS-12Hz-1.7B-Base"
 
@@ -48,7 +56,9 @@ models:
   "qwen3-tts-0.6b-customvoice":
     cmd: >
       vllm serve Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice
-      --port ${PORT} ${vllm-flags}
+      --port ${PORT} ${vllm-base}
+      --gpu-memory-utilization 0.9
+      --stage-configs-path ${sc}/qwen3_tts.yaml
     proxy: "http://127.0.0.1:${PORT}"
     useModelName: "Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice"
     aliases:
@@ -58,6 +68,44 @@ models:
   "qwen3-tts-0.6b-base":
     cmd: >
       vllm serve Qwen/Qwen3-TTS-12Hz-0.6B-Base
-      --port ${PORT} ${vllm-flags}
+      --port ${PORT} ${vllm-base}
+      --gpu-memory-utilization 0.9
+      --stage-configs-path ${sc}/qwen3_tts.yaml
     proxy: "http://127.0.0.1:${PORT}"
     useModelName: "Qwen/Qwen3-TTS-12Hz-0.6B-Base"
+
+  # ---------------------------------------------------------------------------
+  # Qwen2.5-Omni — multimodal chat with audio I/O (2 GPUs)
+  # ---------------------------------------------------------------------------
+
+  "qwen2.5-omni-7b":
+    cmd: >
+      vllm serve Qwen/Qwen2.5-Omni-7B
+      --port ${PORT} ${vllm-base}
+      --stage-configs-path ${sc}/qwen2_5_omni.yaml
+    proxy: "http://127.0.0.1:${PORT}"
+    useModelName: "Qwen/Qwen2.5-Omni-7B"
+
+  # ---------------------------------------------------------------------------
+  # Qwen3-Omni — multimodal chat with audio I/O, MoE (2 GPUs)
+  # ---------------------------------------------------------------------------
+
+  "qwen3-omni-8b":
+    cmd: >
+      vllm serve Qwen/Qwen3-Omni-8B
+      --port ${PORT} ${vllm-base}
+      --stage-configs-path ${sc}/qwen3_omni_moe.yaml
+    proxy: "http://127.0.0.1:${PORT}"
+    useModelName: "Qwen/Qwen3-Omni-8B"
+
+  # ---------------------------------------------------------------------------
+  # Bagel — text/image-to-image diffusion (2 GPUs)
+  # ---------------------------------------------------------------------------
+
+  "bagel-7b-mot":
+    cmd: >
+      vllm serve ByteDance-Seed/Bagel-7B-MoT
+      --port ${PORT} ${vllm-base}
+      --stage-configs-path ${sc}/bagel.yaml
+    proxy: "http://127.0.0.1:${PORT}"
+    useModelName: "ByteDance-Seed/Bagel-7B-MoT"
