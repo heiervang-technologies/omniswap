@@ -1,13 +1,18 @@
-![llama-swap header image](docs/assets/hero3.webp)
-![GitHub Downloads (all assets, all releases)](https://img.shields.io/github/downloads/mostlygeek/llama-swap/total)
-![GitHub Actions Workflow Status](https://img.shields.io/github/actions/workflow/status/mostlygeek/llama-swap/go-ci.yml)
-![GitHub Repo stars](https://img.shields.io/github/stars/mostlygeek/llama-swap)
+# omniswap
 
-# llama-swap
+A fork of [llama-swap](https://github.com/mostlygeek/llama-swap) — a lightweight, transparent proxy server for hot-swapping LLM models.
 
-Run multiple LLM models on your machine and hot-swap between them as needed. llama-swap works with any OpenAI API-compatible server, giving you the flexibility to switch models without restarting your applications.
+## Fork Goals
 
-Built in Go for performance and simplicity, llama-swap has zero dependencies and is incredibly easy to set up. Get started in minutes - just one binary and one configuration file.
+omniswap extends llama-swap with the goal of supporting **all API endpoints exposed by [vLLM](https://github.com/vllm-project/vllm)** (and potentially other inference servers). While llama-swap focuses on OpenAI-compatible endpoints and llama.cpp, omniswap aims to be a complete proxy for the full vLLM API surface — including endpoints for tokenization, detokenization, pooling, scoring, classification, and any other current or future vLLM endpoints.
+
+If an inference server exposes it, omniswap should be able to proxy and hot-swap it.
+
+---
+
+*Everything below is inherited from the upstream llama-swap project.*
+
+---
 
 ## Features:
 
