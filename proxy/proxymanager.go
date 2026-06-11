@@ -502,6 +502,28 @@ func (pm *ProxyManager) listModelsHandler(c *gin.Context) {
 				data = append(data, record)
 			}
 		}
+
+		// Surface `<model>@<node>` addresses so clients can discover node
+		// pinning. For each peer we emit `any@<node>` (route to whatever it has
+		// loaded) plus `<loaded-id>@<node>` for each currently-loaded model.
+		// Kept tight (loaded models only) to avoid bloating the listing.
+		for _, peerID := range pm.peerProxy.PeerOrder() {
+			seen := map[string]bool{}
+			addAddr := func(addr string) {
+				if seen[addr] {
+					return
+				}
+				seen[addr] = true
+				data = append(data, newRecord(addr, config.ModelConfig{
+					Name:     fmt.Sprintf("node %s", peerID),
+					Metadata: map[string]any{"peerID": peerID, "nodeAddress": true},
+				}))
+			}
+			addAddr(anyAlias + "@" + peerID)
+			for _, loadedID := range pm.peerProxy.LoadedModels(peerID) {
+				addAddr(loadedID + "@" + peerID)
+			}
+		}
 	}
 
 	// Sort by the "id" key
@@ -616,85 +638,140 @@ func (pm *ProxyManager) proxyInferenceHandler(c *gin.Context) {
 		return
 	}
 
-	// Look for a matching local model first
 	var nextHandler func(modelID string, w http.ResponseWriter, r *http.Request) error
+	var modelID string
 
-	modelID, found := pm.config.RealModelName(requestedModel)
-	if found {
-		processGroup, err := pm.swapProcessGroup(modelID)
-		if err != nil {
-			pm.sendErrorResponse(c, http.StatusInternalServerError, fmt.Sprintf("error swapping process group: %s", err.Error()))
+	// Resolve `<model>@<node>` addressing before the normal model lookup. A
+	// node-pinned address (e.g. any@crystal, gemma-4-12b@crystal) dispatches
+	// straight to that peer; a non-pinned address (bare model, or model@any)
+	// falls through to the existing local-then-peer routing with any @any
+	// suffix stripped from the model field.
+	if pm.peerProxy != nil {
+		res, rerr := pm.peerProxy.ResolveAddress(requestedModel)
+		if rerr != nil {
+			pm.sendErrorResponse(c, addrErrorCode(rerr), rerr.Error())
 			return
 		}
-
-		// issue #69 allow custom model names to be sent to upstream
-		useModelName := pm.config.Models[modelID].UseModelName
-		if useModelName != "" {
-			bodyBytes, err = sjson.SetBytes(bodyBytes, "model", useModelName)
+		if res.Rewrote {
+			bodyBytes, err = sjson.SetBytes(bodyBytes, "model", res.Model)
 			if err != nil {
 				pm.sendErrorResponse(c, http.StatusInternalServerError, fmt.Sprintf("error rewriting model name in JSON: %s", err.Error()))
 				return
 			}
 		}
+		requestedModel = res.Model
 
-		// issue #174 strip parameters from the JSON body
-		stripParams, err := pm.config.Models[modelID].Filters.SanitizedStripParams()
-		if err != nil { // just log it and continue
-			pm.proxyLogger.Errorf("Error sanitizing strip params string: %s, %s", pm.config.Models[modelID].Filters.StripParams, err.Error())
-		} else {
-			for _, param := range stripParams {
-				pm.proxyLogger.Debugf("<%s> stripping param: %s", modelID, param)
+		if res.PeerID != "" {
+			modelID = res.Model
+			peerID := res.PeerID
+
+			// issue #453 apply the pinned peer's filters
+			peerFilters := pm.peerProxy.PeerFilters(peerID)
+			for _, param := range peerFilters.SanitizedStripParams() {
+				pm.proxyLogger.Debugf("<%s> stripping param: %s", requestedModel, param)
 				bodyBytes, err = sjson.DeleteBytes(bodyBytes, param)
 				if err != nil {
-					pm.sendErrorResponse(c, http.StatusInternalServerError, fmt.Sprintf("error deleting parameter %s from request", param))
+					pm.sendErrorResponse(c, http.StatusInternalServerError, fmt.Sprintf("error stripping parameter %s from request", param))
 					return
 				}
 			}
-		}
+			setParams, setParamKeys := peerFilters.SanitizedSetParams()
+			for _, key := range setParamKeys {
+				pm.proxyLogger.Debugf("<%s> setting param: %s", requestedModel, key)
+				bodyBytes, err = sjson.SetBytes(bodyBytes, key, setParams[key])
+				if err != nil {
+					pm.sendErrorResponse(c, http.StatusInternalServerError, fmt.Sprintf("error setting parameter %s in request", key))
+					return
+				}
+			}
 
-		// issue #453 set/override parameters in the JSON body
-		setParams, setParamKeys := pm.config.Models[modelID].Filters.SanitizedSetParams()
-		for _, key := range setParamKeys {
-			pm.proxyLogger.Debugf("<%s> setting param: %s", modelID, key)
-			bodyBytes, err = sjson.SetBytes(bodyBytes, key, setParams[key])
-			if err != nil {
-				pm.sendErrorResponse(c, http.StatusInternalServerError, fmt.Sprintf("error setting parameter %s in request", key))
-				return
+			pm.proxyLogger.Debugf("ProxyManager using pinned ProxyPeer node=%s model=%s", peerID, modelID)
+			nextHandler = func(mID string, w http.ResponseWriter, r *http.Request) error {
+				return pm.peerProxy.ProxyRequestToPeer(peerID, mID, w, r)
 			}
 		}
+	}
 
-		pm.proxyLogger.Debugf("ProxyManager using local Process for model: %s", requestedModel)
-		nextHandler = processGroup.ProxyRequest
-	} else if pm.peerProxy != nil && pm.peerProxy.HasPeerModel(requestedModel) {
-		pm.proxyLogger.Debugf("ProxyManager using ProxyPeer for model: %s", requestedModel)
-		modelID = requestedModel
-
-		// issue #453 apply filters for peer requests
-		peerFilters := pm.peerProxy.GetPeerFilters(requestedModel)
-
-		// Apply stripParams - remove specified parameters from request
-		stripParams := peerFilters.SanitizedStripParams()
-		for _, param := range stripParams {
-			pm.proxyLogger.Debugf("<%s> stripping param: %s", requestedModel, param)
-			bodyBytes, err = sjson.DeleteBytes(bodyBytes, param)
+	// Look for a matching local model first, then a model-named peer.
+	if nextHandler == nil {
+		localID, found := pm.config.RealModelName(requestedModel)
+		if found {
+			modelID = localID
+			processGroup, err := pm.swapProcessGroup(modelID)
 			if err != nil {
-				pm.sendErrorResponse(c, http.StatusInternalServerError, fmt.Sprintf("error stripping parameter %s from request", param))
+				pm.sendErrorResponse(c, http.StatusInternalServerError, fmt.Sprintf("error swapping process group: %s", err.Error()))
 				return
 			}
-		}
 
-		// Apply setParams - set/override specified parameters in request
-		setParams, setParamKeys := peerFilters.SanitizedSetParams()
-		for _, key := range setParamKeys {
-			pm.proxyLogger.Debugf("<%s> setting param: %s", requestedModel, key)
-			bodyBytes, err = sjson.SetBytes(bodyBytes, key, setParams[key])
-			if err != nil {
-				pm.sendErrorResponse(c, http.StatusInternalServerError, fmt.Sprintf("error setting parameter %s in request", key))
-				return
+			// issue #69 allow custom model names to be sent to upstream
+			useModelName := pm.config.Models[modelID].UseModelName
+			if useModelName != "" {
+				bodyBytes, err = sjson.SetBytes(bodyBytes, "model", useModelName)
+				if err != nil {
+					pm.sendErrorResponse(c, http.StatusInternalServerError, fmt.Sprintf("error rewriting model name in JSON: %s", err.Error()))
+					return
+				}
 			}
-		}
 
-		nextHandler = pm.peerProxy.ProxyRequest
+			// issue #174 strip parameters from the JSON body
+			stripParams, err := pm.config.Models[modelID].Filters.SanitizedStripParams()
+			if err != nil { // just log it and continue
+				pm.proxyLogger.Errorf("Error sanitizing strip params string: %s, %s", pm.config.Models[modelID].Filters.StripParams, err.Error())
+			} else {
+				for _, param := range stripParams {
+					pm.proxyLogger.Debugf("<%s> stripping param: %s", modelID, param)
+					bodyBytes, err = sjson.DeleteBytes(bodyBytes, param)
+					if err != nil {
+						pm.sendErrorResponse(c, http.StatusInternalServerError, fmt.Sprintf("error deleting parameter %s from request", param))
+						return
+					}
+				}
+			}
+
+			// issue #453 set/override parameters in the JSON body
+			setParams, setParamKeys := pm.config.Models[modelID].Filters.SanitizedSetParams()
+			for _, key := range setParamKeys {
+				pm.proxyLogger.Debugf("<%s> setting param: %s", modelID, key)
+				bodyBytes, err = sjson.SetBytes(bodyBytes, key, setParams[key])
+				if err != nil {
+					pm.sendErrorResponse(c, http.StatusInternalServerError, fmt.Sprintf("error setting parameter %s in request", key))
+					return
+				}
+			}
+
+			pm.proxyLogger.Debugf("ProxyManager using local Process for model: %s", requestedModel)
+			nextHandler = processGroup.ProxyRequest
+		} else if pm.peerProxy != nil && pm.peerProxy.HasPeerModel(requestedModel) {
+			pm.proxyLogger.Debugf("ProxyManager using ProxyPeer for model: %s", requestedModel)
+			modelID = requestedModel
+
+			// issue #453 apply filters for peer requests
+			peerFilters := pm.peerProxy.GetPeerFilters(requestedModel)
+
+			// Apply stripParams - remove specified parameters from request
+			stripParams := peerFilters.SanitizedStripParams()
+			for _, param := range stripParams {
+				pm.proxyLogger.Debugf("<%s> stripping param: %s", requestedModel, param)
+				bodyBytes, err = sjson.DeleteBytes(bodyBytes, param)
+				if err != nil {
+					pm.sendErrorResponse(c, http.StatusInternalServerError, fmt.Sprintf("error stripping parameter %s from request", param))
+					return
+				}
+			}
+
+			// Apply setParams - set/override specified parameters in request
+			setParams, setParamKeys := peerFilters.SanitizedSetParams()
+			for _, key := range setParamKeys {
+				pm.proxyLogger.Debugf("<%s> setting param: %s", requestedModel, key)
+				bodyBytes, err = sjson.SetBytes(bodyBytes, key, setParams[key])
+				if err != nil {
+					pm.sendErrorResponse(c, http.StatusInternalServerError, fmt.Sprintf("error setting parameter %s in request", key))
+					return
+				}
+			}
+
+			nextHandler = pm.peerProxy.ProxyRequest
+		}
 	}
 
 	if nextHandler == nil {
@@ -744,16 +821,37 @@ func (pm *ProxyManager) proxyOAIPostFormHandler(c *gin.Context) {
 		return
 	}
 
-	modelID, found := pm.config.RealModelName(requestedModel)
-	if !found {
-		pm.sendErrorResponse(c, http.StatusBadRequest, fmt.Sprintf("could not find real modelID for %s", requestedModel))
-		return
+	// Resolve `<model>@<node>` addressing (same grammar as the JSON handler).
+	// A node-pinned address dispatches straight to that peer.
+	var pinnedPeerID string
+	if pm.peerProxy != nil {
+		res, rerr := pm.peerProxy.ResolveAddress(requestedModel)
+		if rerr != nil {
+			pm.sendErrorResponse(c, addrErrorCode(rerr), rerr.Error())
+			return
+		}
+		requestedModel = res.Model
+		pinnedPeerID = res.PeerID
 	}
 
-	processGroup, err := pm.swapProcessGroup(modelID)
-	if err != nil {
-		pm.sendErrorResponse(c, http.StatusInternalServerError, fmt.Sprintf("error swapping process group: %s", err.Error()))
-		return
+	var modelID string
+	var processGroup *ProcessGroup
+	if pinnedPeerID == "" {
+		var found bool
+		modelID, found = pm.config.RealModelName(requestedModel)
+		if !found {
+			pm.sendErrorResponse(c, http.StatusBadRequest, fmt.Sprintf("could not find real modelID for %s", requestedModel))
+			return
+		}
+
+		var err error
+		processGroup, err = pm.swapProcessGroup(modelID)
+		if err != nil {
+			pm.sendErrorResponse(c, http.StatusInternalServerError, fmt.Sprintf("error swapping process group: %s", err.Error()))
+			return
+		}
+	} else {
+		modelID = requestedModel
 	}
 
 	// We need to reconstruct the multipart form in any case since the body is consumed
@@ -839,7 +937,13 @@ func (pm *ProxyManager) proxyOAIPostFormHandler(c *gin.Context) {
 	modifiedReq.ContentLength = int64(requestBuffer.Len())
 
 	// Use the modified request for proxying
-	if err := processGroup.ProxyRequest(modelID, c.Writer, modifiedReq); err != nil {
+	if pinnedPeerID != "" {
+		if err := pm.peerProxy.ProxyRequestToPeer(pinnedPeerID, modelID, c.Writer, modifiedReq); err != nil {
+			pm.sendErrorResponse(c, http.StatusInternalServerError, fmt.Sprintf("error proxying request: %s", err.Error()))
+			pm.proxyLogger.Errorf("Error Proxying Request to node %s for model %s", pinnedPeerID, modelID)
+			return
+		}
+	} else if err := processGroup.ProxyRequest(modelID, c.Writer, modifiedReq); err != nil {
 		pm.sendErrorResponse(c, http.StatusInternalServerError, fmt.Sprintf("error proxying request: %s", err.Error()))
 		pm.proxyLogger.Errorf("Error Proxying Request for processGroup %s and model %s", processGroup.id, modelID)
 		return

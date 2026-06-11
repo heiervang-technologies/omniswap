@@ -8,6 +8,7 @@ import (
 	"runtime"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/mostlygeek/llama-swap/proxy/config"
@@ -22,10 +23,27 @@ type peerProxyMember struct {
 type PeerProxy struct {
 	peers    config.PeerDictionaryConfig
 	proxyMap map[string]*peerProxyMember
+
+	// memberByPeer indexes proxy members by peer id for node-pinned (`@node`)
+	// dispatch, which bypasses the model->peer map.
+	memberByPeer map[string]*peerProxyMember
+	// peerOrder is the sorted list of peer ids, for deterministic wildcard
+	// resolution and error messages.
+	peerOrder []string
+
+	logger *LogMonitor
+
+	// loaded-state cache for resolving the `any` wildcard against what each
+	// peer currently has up. See peeraddress.go.
+	httpClient  *http.Client
+	loadedMu    sync.RWMutex
+	loadedCache map[string]peerLoadedSet
+	loadedTTL   time.Duration
 }
 
 func NewPeerProxy(peers config.PeerDictionaryConfig, proxyLogger *LogMonitor) (*PeerProxy, error) {
 	proxyMap := make(map[string]*peerProxyMember)
+	memberByPeer := make(map[string]*peerProxyMember)
 
 	// Sort peer IDs for consistent iteration order
 	peerIDs := make([]string, 0, len(peers))
@@ -84,6 +102,7 @@ func NewPeerProxy(peers config.PeerDictionaryConfig, proxyLogger *LogMonitor) (*
 			reverseProxy: reverseProxy,
 			apiKey:       peer.ApiKey,
 		}
+		memberByPeer[peerID] = pp
 
 		// Map each model to this peer's proxy
 		for _, modelID := range peer.Models {
@@ -96,8 +115,16 @@ func NewPeerProxy(peers config.PeerDictionaryConfig, proxyLogger *LogMonitor) (*
 	}
 
 	return &PeerProxy{
-		peers:    peers,
-		proxyMap: proxyMap,
+		peers:        peers,
+		proxyMap:     proxyMap,
+		memberByPeer: memberByPeer,
+		peerOrder:    peerIDs,
+		logger:       proxyLogger,
+		// Short-timeout client used only for polling peers' /v1/models to
+		// resolve the `any` wildcard; never used for streaming inference.
+		httpClient:  &http.Client{Timeout: 5 * time.Second},
+		loadedCache: make(map[string]peerLoadedSet),
+		loadedTTL:   5 * time.Second,
 	}, nil
 }
 
@@ -138,4 +165,31 @@ func (p *PeerProxy) ProxyRequest(model_id string, writer http.ResponseWriter, re
 
 	pp.reverseProxy.ServeHTTP(writer, request)
 	return nil
+}
+
+// ProxyRequestToPeer dispatches directly to a named peer, bypassing the
+// model->peer map. Used for node-pinned (`<model>@<node>`) addressing where the
+// caller has already chosen the node.
+func (p *PeerProxy) ProxyRequestToPeer(peerID, modelID string, writer http.ResponseWriter, request *http.Request) error {
+	pp, found := p.memberByPeer[peerID]
+	if !found {
+		return fmt.Errorf("no peer proxy found for node %s", peerID)
+	}
+
+	if pp.apiKey != "" {
+		request.Header.Set("Authorization", "Bearer "+pp.apiKey)
+		request.Header.Set("x-api-key", pp.apiKey)
+	}
+
+	pp.reverseProxy.ServeHTTP(writer, request)
+	return nil
+}
+
+// PeerFilters returns the filters configured for a peer by id.
+func (p *PeerProxy) PeerFilters(peerID string) config.Filters {
+	peer, found := p.peers[peerID]
+	if !found {
+		return config.Filters{}
+	}
+	return peer.Filters
 }

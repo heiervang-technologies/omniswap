@@ -261,8 +261,10 @@ func TestProxyManager_ListModelsHandler(t *testing.T) {
 		t.Fatalf("Failed to parse JSON response: %v", err)
 	}
 
-	// Check the number of models returned (3 local + 2 peer models)
-	assert.Len(t, response.Data, 5)
+	// Check the number of models returned (3 local + 2 peer models +
+	// 1 node-address alias any@peer1; the peer has nothing loaded in this
+	// test so no <model>@peer1 entries are added).
+	assert.Len(t, response.Data, 6)
 
 	// Check the details of each model
 	expectedModels := map[string]struct{}{
@@ -271,6 +273,7 @@ func TestProxyManager_ListModelsHandler(t *testing.T) {
 		"model3":       {},
 		"peer-model-a": {},
 		"peer-model-b": {},
+		"any@peer1":    {},
 	}
 
 	// make all models
@@ -301,8 +304,8 @@ func TestProxyManager_ListModelsHandler(t *testing.T) {
 			description, ok := model["description"].(string)
 			assert.True(t, ok, "description should be a string")
 			assert.Equal(t, "Model 1 description is used for testing", description)
-		} else if modelID == "peer-model-a" || modelID == "peer-model-b" {
-			// Peer models should have meta.llamaswap.peerID
+		} else if modelID == "peer-model-a" || modelID == "peer-model-b" || modelID == "any@peer1" {
+			// Peer models and node-address aliases carry meta.llamaswap.peerID
 			meta, exists := model["meta"]
 			assert.True(t, exists, "peer model should have meta field")
 			metaMap, ok := meta.(map[string]interface{})
