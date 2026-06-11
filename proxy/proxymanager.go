@@ -499,6 +499,13 @@ func (pm *ProxyManager) listModelsHandler(c *gin.Context) {
 					},
 				})
 
+				// Stamp live loaded-status so aggregating clients can group
+				// "loaded" (VRAM-resident) models. Only set when actually
+				// loaded — absence reads as "not loaded" downstream.
+				if pm.peerProxy.IsPeerModelLoaded(peerID, modelID) {
+					record["status"] = gin.H{"value": "loaded"}
+				}
+
 				data = append(data, record)
 			}
 		}
@@ -509,19 +516,25 @@ func (pm *ProxyManager) listModelsHandler(c *gin.Context) {
 		// Kept tight (loaded models only) to avoid bloating the listing.
 		for _, peerID := range pm.peerProxy.PeerOrder() {
 			seen := map[string]bool{}
-			addAddr := func(addr string) {
+			addAddr := func(addr string, loaded bool) {
 				if seen[addr] {
 					return
 				}
 				seen[addr] = true
-				data = append(data, newRecord(addr, config.ModelConfig{
+				rec := newRecord(addr, config.ModelConfig{
 					Name:     fmt.Sprintf("node %s", peerID),
 					Metadata: map[string]any{"peerID": peerID, "nodeAddress": true},
-				}))
+				})
+				// A `<loaded-id>@<node>` address is loaded by construction; the
+				// `any@<node>` wildcard is a router alias, not itself resident.
+				if loaded {
+					rec["status"] = gin.H{"value": "loaded"}
+				}
+				data = append(data, rec)
 			}
-			addAddr(anyAlias + "@" + peerID)
+			addAddr(anyAlias+"@"+peerID, false)
 			for _, loadedID := range pm.peerProxy.LoadedModels(peerID) {
-				addAddr(loadedID + "@" + peerID)
+				addAddr(loadedID+"@"+peerID, true)
 			}
 		}
 	}

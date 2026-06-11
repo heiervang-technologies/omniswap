@@ -210,6 +210,19 @@ func (p *PeerProxy) PeerOrder() []string {
 	return p.peerOrder
 }
 
+// IsPeerModelLoaded reports whether the named peer currently has modelID loaded
+// (matched against the peer's reported ids and aliases). Used by the /v1/models
+// listing to stamp loaded-status on peer entries so aggregating clients (e.g.
+// heierchat) can group "loaded" models without per-node configuration. Reads
+// the same short-TTL loaded-state cache as the `@node` resolver.
+func (p *PeerProxy) IsPeerModelLoaded(peerID, modelID string) bool {
+	peer, found := p.peers[peerID]
+	if !found {
+		return false
+	}
+	return p.peerLoaded(peerID, peer).all[modelID]
+}
+
 // peerLoaded returns a short-TTL snapshot of the peer's loaded models, querying
 // the peer's /v1/models when the cache is stale. On query failure it keeps the
 // previous snapshot for one more cycle, else returns an empty (but timestamped)

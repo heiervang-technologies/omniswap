@@ -329,6 +329,70 @@ func TestProxyManager_ListModelsHandler(t *testing.T) {
 	assert.Empty(t, expectedModels, "not all expected models were returned")
 }
 
+// When a peer reports a model as loaded, /v1/models stamps status.value=loaded
+// on that peer model entry and on its `<id>@<node>` address — but not on the
+// unloaded sibling or the `any@<node>` wildcard. This drives the "loaded
+// models" grouping in aggregating clients (heierchat) with no per-node config.
+func TestProxyManager_ListModelsHandler_LoadedStatusEnrichment(t *testing.T) {
+	cfg := config.Config{
+		HealthCheckTimeout: 15,
+		Peers: map[string]config.PeerConfig{
+			"crystal": {
+				Proxy:  "http://crystal:8080",
+				Models: []string{"gemma-4-12b", "qwen3-4b"},
+			},
+		},
+		LogLevel: "error",
+	}
+
+	proxy := New(cfg)
+
+	// Seed the loaded-state cache so "gemma-4-12b" reports loaded on crystal,
+	// fresh enough that peerLoaded serves it without a live network fetch.
+	proxy.peerProxy.loadedMu.Lock()
+	proxy.peerProxy.loadedCache["crystal"] = peerLoadedSet{
+		order:     []string{"gemma-4-12b"},
+		all:       map[string]bool{"gemma-4-12b": true},
+		fetchedAt: time.Now(),
+	}
+	proxy.peerProxy.loadedMu.Unlock()
+
+	req := httptest.NewRequest("GET", "/v1/models", nil)
+	w := CreateTestResponseRecorder()
+	proxy.ServeHTTP(w, req)
+	assert.Equal(t, http.StatusOK, w.Code)
+
+	var response struct {
+		Data []map[string]interface{} `json:"data"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &response); err != nil {
+		t.Fatalf("Failed to parse JSON response: %v", err)
+	}
+
+	statusByID := map[string]string{}
+	present := map[string]bool{}
+	for _, m := range response.Data {
+		id, _ := m["id"].(string)
+		present[id] = true
+		if s, ok := m["status"].(map[string]interface{}); ok {
+			if v, ok := s["value"].(string); ok {
+				statusByID[id] = v
+			}
+		}
+	}
+
+	// Loaded peer model + its node-address carry status.value=loaded.
+	assert.Equal(t, "loaded", statusByID["gemma-4-12b"], "loaded peer model should carry status.value=loaded")
+	assert.Equal(t, "loaded", statusByID["gemma-4-12b@crystal"], "loaded node-address should carry status.value=loaded")
+	assert.True(t, present["gemma-4-12b@crystal"], "expected node-address alias gemma-4-12b@crystal present")
+
+	// The unloaded sibling and the wildcard alias must NOT be stamped loaded.
+	_, hasUnloaded := statusByID["qwen3-4b"]
+	assert.False(t, hasUnloaded, "unloaded peer model should not carry a loaded status")
+	_, hasWildcard := statusByID["any@crystal"]
+	assert.False(t, hasWildcard, "any@node wildcard should not be stamped loaded")
+}
+
 func TestProxyManager_ListModelsHandler_WithMetadata(t *testing.T) {
 	// Process config through LoadConfigFromReader to apply macro substitution
 	configYaml := `
