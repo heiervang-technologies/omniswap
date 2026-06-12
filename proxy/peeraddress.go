@@ -64,10 +64,11 @@ type AddressResolution struct {
 	Rewrote bool
 }
 
-// peerLoadedSet is a short-lived snapshot of one peer's loaded models.
+// peerLoadedSet is a short-lived snapshot of one peer's advertised models.
 type peerLoadedSet struct {
 	order     []string        // loaded model ids, in the order the peer listed them
 	all       map[string]bool // loaded ids + their aliases, for membership checks
+	served    map[string]bool // ALL advertised ids + aliases (loaded or cold), for routing
 	fetchedAt time.Time
 }
 
@@ -146,8 +147,9 @@ func (p *PeerProxy) ResolveAddress(raw string) (AddressResolution, error) {
 			}
 			return AddressResolution{PeerID: node, Model: picked, Rewrote: true}, nil
 		}
-		// model@node: confirm the node can serve the model (declared in config
-		// or currently loaded) so we fail fast with a clear message.
+		// model@node: confirm the node can serve the model (declared in config,
+		// advertised in its /v1/models, or currently loaded) so we fail fast with
+		// a clear message; the peer cold-loads it on dispatch if it isn't resident.
 		if !p.peerServesModel(node, peer, model) {
 			return AddressResolution{}, &addrError{
 				code: http.StatusBadRequest,
@@ -171,16 +173,20 @@ func (p *PeerProxy) pickModelForPeer(peerID string, peer config.PeerConfig) stri
 	return ""
 }
 
-// peerServesModel reports whether the named peer can serve modelID — either it
-// is declared in the static config, or the peer currently has it loaded (covers
-// ids/aliases a peer exposes that aren't enumerated in config).
+// peerServesModel reports whether the named peer can serve modelID — i.e. the
+// peer can be asked to run it (cold-loading on demand if necessary). True when
+// the model is declared in static config, or the peer currently advertises it
+// in /v1/models (loaded OR cold-but-swappable), or it is a live id/alias. This
+// makes `<model>@<node>` a generic "pin node, pick any model that node serves"
+// primitive rather than only resolving the pre-advertised alias entries.
 func (p *PeerProxy) peerServesModel(peerID string, peer config.PeerConfig, modelID string) bool {
 	for _, m := range peer.Models {
 		if m == modelID {
 			return true
 		}
 	}
-	return p.peerLoaded(peerID, peer).all[modelID]
+	loaded := p.peerLoaded(peerID, peer)
+	return loaded.served[modelID] || loaded.all[modelID]
 }
 
 // firstLoadedAnywhere walks peers in deterministic order and returns the first
@@ -243,7 +249,7 @@ func (p *PeerProxy) peerLoaded(peerID string, peer config.PeerConfig) peerLoaded
 		if found {
 			return cached // keep the stale snapshot for one more cycle
 		}
-		empty := peerLoadedSet{all: map[string]bool{}, fetchedAt: time.Now()}
+		empty := peerLoadedSet{all: map[string]bool{}, served: map[string]bool{}, fetchedAt: time.Now()}
 		p.loadedMu.Lock()
 		p.loadedCache[peerID] = empty
 		p.loadedMu.Unlock()
@@ -296,11 +302,13 @@ type modelsListPayload struct {
 	} `json:"data"`
 }
 
-// parseLoadedModels extracts the loaded model ids (and aliases) from a
-// /v1/models response. An entry counts as loaded when it has no status field
-// (a plain llama-server) or its status.value == "loaded".
+// parseLoadedModels extracts a peer's advertised models from a /v1/models
+// response. Every entry is recorded in `served` (routable, possibly via a cold
+// swap). The subset that is actually resident — an entry with no status field
+// (a plain llama-server) or status.value == "loaded" — additionally populates
+// `order`/`all` (the loaded set surfaced as hot ids and `<id>@<node>` aliases).
 func parseLoadedModels(body []byte, at time.Time) peerLoadedSet {
-	set := peerLoadedSet{all: map[string]bool{}, fetchedAt: at}
+	set := peerLoadedSet{all: map[string]bool{}, served: map[string]bool{}, fetchedAt: at}
 	var payload modelsListPayload
 	if err := json.Unmarshal(body, &payload); err != nil {
 		return set
@@ -309,6 +317,14 @@ func parseLoadedModels(body []byte, at time.Time) peerLoadedSet {
 		if m.ID == "" {
 			continue
 		}
+		// Everything the peer advertises is routable (may cold-load).
+		set.served[m.ID] = true
+		for _, a := range m.Aliases {
+			if a != "" {
+				set.served[a] = true
+			}
+		}
+		// Only resident models count as "loaded".
 		if m.Status != nil && !strings.EqualFold(m.Status.Value, "loaded") {
 			continue
 		}

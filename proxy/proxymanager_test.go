@@ -393,6 +393,53 @@ func TestProxyManager_ListModelsHandler_LoadedStatusEnrichment(t *testing.T) {
 	assert.False(t, hasWildcard, "any@node wildcard should not be stamped loaded")
 }
 
+// `<model>@<node>` resolves for ANY model the peer advertises (loaded or cold),
+// not just static-config or currently-loaded entries — the generic "pin node,
+// pick model" routing primitive. A model the peer does not advertise still 400s.
+func TestPeerProxy_ResolveAddress_GenericModelAtNode(t *testing.T) {
+	cfg := config.Config{
+		HealthCheckTimeout: 15,
+		Peers: map[string]config.PeerConfig{
+			"crystal": {
+				Proxy:  "http://crystal:8080",
+				Models: []string{"gemma-4-12b"}, // static config declares only one
+			},
+		},
+		LogLevel: "error",
+	}
+	proxy := New(cfg)
+	pp := proxy.peerProxy
+
+	// crystal advertises a COLD model 'qwen3-30b' (served, not loaded) alongside
+	// the loaded 'gemma-4-12b'. Seed fresh so peerLoaded serves it without a fetch.
+	pp.loadedMu.Lock()
+	pp.loadedCache["crystal"] = peerLoadedSet{
+		order:     []string{"gemma-4-12b"},
+		all:       map[string]bool{"gemma-4-12b": true},
+		served:    map[string]bool{"gemma-4-12b": true, "qwen3-30b": true},
+		fetchedAt: time.Now(),
+	}
+	pp.loadedMu.Unlock()
+
+	// Cold-but-advertised model resolves to the peer (it cold-loads on dispatch).
+	res, err := pp.ResolveAddress("qwen3-30b@crystal")
+	assert.NoError(t, err)
+	assert.Equal(t, "crystal", res.PeerID)
+	assert.Equal(t, "qwen3-30b", res.Model)
+	assert.True(t, res.Rewrote)
+
+	// Static-config model still resolves.
+	res, err = pp.ResolveAddress("gemma-4-12b@crystal")
+	assert.NoError(t, err)
+	assert.Equal(t, "crystal", res.PeerID)
+	assert.Equal(t, "gemma-4-12b", res.Model)
+
+	// A model the peer does NOT advertise fails fast with 400.
+	_, err = pp.ResolveAddress("not-a-real-model@crystal")
+	assert.Error(t, err)
+	assert.Equal(t, http.StatusBadRequest, addrErrorCode(err))
+}
+
 func TestProxyManager_ListModelsHandler_WithMetadata(t *testing.T) {
 	// Process config through LoadConfigFromReader to apply macro substitution
 	configYaml := `
