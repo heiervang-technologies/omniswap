@@ -25,6 +25,10 @@ FROM ${VLLM_OMNI_IMAGE}:${VLLM_OMNI_TAG}
 
 WORKDIR /app
 
+# Trim workspace: remove .venv (8GB), .git (23MB), keep only vllm_omni source
+RUN rm -rf /workspace/vllm-omni/.venv /workspace/vllm-omni/.git \
+    && find /workspace/vllm-omni -name '__pycache__' -type d -exec rm -rf {} + 2>/dev/null; true
+
 COPY --from=builder /omniswap /app/omniswap
 COPY docker/omniswap-config.example.yaml /app/config.yaml
 COPY docker/stage-configs/ /app/stage-configs/
