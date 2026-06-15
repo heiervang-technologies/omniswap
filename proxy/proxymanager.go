@@ -506,6 +506,26 @@ func (pm *ProxyManager) listModelsHandler(c *gin.Context) {
 					record["status"] = gin.H{"value": "loaded"}
 				}
 
+				// Propagate the peer's advertised modality signature so clients
+				// can group/route by capability (vision, omni, image-out, ...).
+				// The bare peer model-id list drops the source node-router's
+				// `architecture` block; re-stamp it here, both as a top-level
+				// `architecture` (mirrors the source shape) and folded into
+				// meta.llamaswap alongside peerID (what the webui reads from the
+				// surviving meta block).
+				if in, out, ok := pm.peerProxy.PeerModelModality(peerID, modelID); ok {
+					record["architecture"] = gin.H{
+						"input_modalities":  in,
+						"output_modalities": out,
+					}
+					if meta, mok := record["meta"].(gin.H); mok {
+						if ls, lok := meta["llamaswap"].(map[string]any); lok {
+							ls["input_modalities"] = in
+							ls["output_modalities"] = out
+						}
+					}
+				}
+
 				data = append(data, record)
 			}
 		}

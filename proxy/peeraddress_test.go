@@ -170,3 +170,31 @@ func TestParseLoadedModels(t *testing.T) {
 		t.Error("stopped model should not be marked loaded")
 	}
 }
+
+func TestParseLoadedModelsModality(t *testing.T) {
+	body := []byte(`{"data":[
+		{"id":"gemma-4-12b","aliases":["omni"],"status":{"value":"loaded"},
+		 "architecture":{"input_modalities":["text","image","audio"],"output_modalities":["text"]}},
+		{"id":"sdxl","status":{"value":"stopped"},
+		 "architecture":{"input_modalities":["text"],"output_modalities":["image"]}},
+		{"id":"plain-text-no-arch","status":{"value":"loaded"}}
+	]}`)
+	set := parseLoadedModels(body, time.Now())
+
+	// Modality is captured for the loaded multimodal model, keyed by id AND alias.
+	mod, ok := set.modalities["gemma-4-12b"]
+	if !ok || len(mod.Input) != 3 || mod.Input[1] != "image" || mod.Output[0] != "text" {
+		t.Fatalf("gemma modality not captured correctly: %+v ok=%v", mod, ok)
+	}
+	if a, ok := set.modalities["omni"]; !ok || len(a.Input) != 3 {
+		t.Error("expected alias 'omni' to carry the same modality")
+	}
+	// Modality is independent of loaded status — a cold model still has caps.
+	if sd, ok := set.modalities["sdxl"]; !ok || sd.Output[0] != "image" {
+		t.Errorf("cold image-out model should still carry modality: %+v ok=%v", sd, ok)
+	}
+	// A model with no architecture block contributes no modality entry.
+	if _, ok := set.modalities["plain-text-no-arch"]; ok {
+		t.Error("model without architecture should have no modality entry")
+	}
+}

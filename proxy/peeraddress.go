@@ -64,12 +64,21 @@ type AddressResolution struct {
 	Rewrote bool
 }
 
+// modelModality is a peer model's advertised input/output modality signature,
+// lifted from its /v1/models `architecture` block. Propagated through the
+// aggregated union so clients can group/route by capability (vision, omni, etc.).
+type modelModality struct {
+	Input  []string
+	Output []string
+}
+
 // peerLoadedSet is a short-lived snapshot of one peer's advertised models.
 type peerLoadedSet struct {
-	order     []string        // loaded model ids, in the order the peer listed them
-	all       map[string]bool // loaded ids + their aliases, for membership checks
-	served    map[string]bool // ALL advertised ids + aliases (loaded or cold), for routing
-	fetchedAt time.Time
+	order      []string                 // loaded model ids, in the order the peer listed them
+	all        map[string]bool          // loaded ids + their aliases, for membership checks
+	served     map[string]bool          // ALL advertised ids + aliases (loaded or cold), for routing
+	modalities map[string]modelModality // id/alias -> advertised modality (only when the peer reports one)
+	fetchedAt  time.Time
 }
 
 // isWildcard reports whether a model/node component means "any" — either empty
@@ -229,6 +238,23 @@ func (p *PeerProxy) IsPeerModelLoaded(peerID, modelID string) bool {
 	return p.peerLoaded(peerID, peer).all[modelID]
 }
 
+// PeerModelModality returns the input/output modality signature a peer advertises
+// for modelID (from its /v1/models `architecture` block), if any. Reads the same
+// short-TTL cache as the loaded-status stamping, so it costs no extra peer poll.
+// Used by the /v1/models union to propagate capability metadata that the bare
+// peer model-id list would otherwise drop.
+func (p *PeerProxy) PeerModelModality(peerID, modelID string) (input, output []string, ok bool) {
+	peer, found := p.peers[peerID]
+	if !found {
+		return nil, nil, false
+	}
+	mod, ok := p.peerLoaded(peerID, peer).modalities[modelID]
+	if !ok {
+		return nil, nil, false
+	}
+	return mod.Input, mod.Output, true
+}
+
 // peerLoaded returns a short-TTL snapshot of the peer's loaded models, querying
 // the peer's /v1/models when the cache is stale. On query failure it keeps the
 // previous snapshot for one more cycle, else returns an empty (but timestamped)
@@ -299,6 +325,10 @@ type modelsListPayload struct {
 		Status  *struct {
 			Value string `json:"value"`
 		} `json:"status"`
+		Architecture *struct {
+			InputModalities  []string `json:"input_modalities"`
+			OutputModalities []string `json:"output_modalities"`
+		} `json:"architecture"`
 	} `json:"data"`
 }
 
@@ -308,7 +338,7 @@ type modelsListPayload struct {
 // (a plain llama-server) or status.value == "loaded" — additionally populates
 // `order`/`all` (the loaded set surfaced as hot ids and `<id>@<node>` aliases).
 func parseLoadedModels(body []byte, at time.Time) peerLoadedSet {
-	set := peerLoadedSet{all: map[string]bool{}, served: map[string]bool{}, fetchedAt: at}
+	set := peerLoadedSet{all: map[string]bool{}, served: map[string]bool{}, modalities: map[string]modelModality{}, fetchedAt: at}
 	var payload modelsListPayload
 	if err := json.Unmarshal(body, &payload); err != nil {
 		return set
@@ -322,6 +352,18 @@ func parseLoadedModels(body []byte, at time.Time) peerLoadedSet {
 		for _, a := range m.Aliases {
 			if a != "" {
 				set.served[a] = true
+			}
+		}
+		// Capture the advertised modality signature (independent of loaded
+		// status — a cold model still has a fixed capability). Keyed by id and
+		// every alias so a union lookup hits regardless of which name is used.
+		if m.Architecture != nil && (len(m.Architecture.InputModalities) > 0 || len(m.Architecture.OutputModalities) > 0) {
+			mod := modelModality{Input: m.Architecture.InputModalities, Output: m.Architecture.OutputModalities}
+			set.modalities[m.ID] = mod
+			for _, a := range m.Aliases {
+				if a != "" {
+					set.modalities[a] = mod
+				}
 			}
 		}
 		// Only resident models count as "loaded".
