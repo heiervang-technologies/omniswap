@@ -198,3 +198,96 @@ func TestParseLoadedModelsModality(t *testing.T) {
 		t.Error("model without architecture should have no modality entry")
 	}
 }
+
+func eqStrSlice(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}
+
+func TestParseCapability(t *testing.T) {
+	cases := []struct {
+		in        string
+		isCap     bool
+		reqIn     []string
+		reqOut    []string
+		expectErr bool
+	}{
+		{"any[text,image]to[text]", true, []string{"text", "image"}, []string{"text"}, false},
+		{"[text]to[image]", true, []string{"text"}, []string{"image"}, false},
+		{"ANY[Text]TO[Audio]", true, []string{"text"}, []string{"audio"}, false},
+		{"any[]to[text]", true, []string{}, []string{"text"}, false}, // unconstrained input axis
+		{"gemma-4-31b", false, nil, nil, false},                      // plain id
+		{"any", false, nil, nil, false},                              // bare wildcard
+		{"anything", false, nil, nil, false},                         // not a capability
+		{"any[text]image]", false, nil, nil, true},                   // malformed: no 'to['
+		{"[text]to", false, nil, nil, true},                          // missing output bracket
+	}
+	for _, c := range cases {
+		in, out, isCap, err := parseCapability(c.in)
+		if c.expectErr {
+			if err == nil {
+				t.Errorf("parseCapability(%q): expected error, got none", c.in)
+			}
+			continue
+		}
+		if err != nil {
+			t.Errorf("parseCapability(%q): unexpected error: %v", c.in, err)
+			continue
+		}
+		if isCap != c.isCap {
+			t.Errorf("parseCapability(%q): isCap=%v want %v", c.in, isCap, c.isCap)
+		}
+		if isCap && (!eqStrSlice(in, c.reqIn) || !eqStrSlice(out, c.reqOut)) {
+			t.Errorf("parseCapability(%q) = in=%v out=%v; want in=%v out=%v", c.in, in, out, c.reqIn, c.reqOut)
+		}
+	}
+}
+
+func TestResolveCapabilityAddress(t *testing.T) {
+	p := newTestPeerProxy()
+	now := time.Now()
+	// titan: vision LLM; crystal: omni-input LLM; lithium: text-only.
+	p.loadedCache["titan"] = peerLoadedSet{
+		order: []string{"gemma-4-31b"}, all: map[string]bool{"gemma-4-31b": true},
+		modalities: map[string]modelModality{"gemma-4-31b": {Input: []string{"text", "image"}, Output: []string{"text"}}},
+		fetchedAt:  now,
+	}
+	p.loadedCache["crystal"] = peerLoadedSet{
+		order: []string{"gemma-4-12b"}, all: map[string]bool{"gemma-4-12b": true, "crystal": true},
+		modalities: map[string]modelModality{"gemma-4-12b": {Input: []string{"text", "image", "audio"}, Output: []string{"text"}}},
+		fetchedAt:  now,
+	}
+	p.loadedCache["lithium"] = peerLoadedSet{
+		order: []string{"nanbeige-3b"}, all: map[string]bool{"nanbeige-3b": true},
+		modalities: map[string]modelModality{"nanbeige-3b": {Input: []string{"text"}, Output: []string{"text"}}},
+		fetchedAt:  now,
+	}
+
+	// any node, vision: first peer in order (crystal) that qualifies.
+	if res, err := p.ResolveAddress("any[text,image]to[text]"); err != nil || res.PeerID != "crystal" || res.Model != "gemma-4-12b" {
+		t.Errorf("any[text,image]to[text] -> %+v err=%v; want crystal/gemma-4-12b", res, err)
+	}
+	// pinned to a node.
+	if res, err := p.ResolveAddress("any[text,image]to[text]@titan"); err != nil || res.PeerID != "titan" || res.Model != "gemma-4-31b" {
+		t.Errorf("@titan -> %+v err=%v; want titan/gemma-4-31b", res, err)
+	}
+	// audio input: only crystal (omni) qualifies.
+	if res, err := p.ResolveAddress("[text,audio]to[text]"); err != nil || res.PeerID != "crystal" {
+		t.Errorf("[text,audio]to[text] -> %+v err=%v; want crystal", res, err)
+	}
+	// image OUTPUT: no LLM peer produces image -> error (lives on comfy-openai).
+	if _, err := p.ResolveAddress("any[text]to[image]"); err == nil {
+		t.Error("any[text]to[image]: expected error (no LLM peer produces image)")
+	}
+	// pinned node that can't satisfy -> error.
+	if _, err := p.ResolveAddress("[text,audio]to[text]@titan"); err == nil {
+		t.Error("[text,audio]to[text]@titan: expected error (titan has no audio-input model)")
+	}
+}
