@@ -772,6 +772,58 @@ func TestProxyManager_RouterUnload_ForwardsToPeer(t *testing.T) {
 	assert.NotContains(t, gotBody, "@gem")
 }
 
+// An already-cold model on a peer router lacking idempotent-unload returns 4xx
+// "model is not running"; the pool must normalize that to 200 {already_unloaded}
+// so unload is idempotent regardless of peer version. A genuinely-unknown model
+// ("not found") must NOT be masked — it passes through as the real error.
+func TestProxyManager_RouterUnload_NormalizesAlreadyCold(t *testing.T) {
+	var peerStatus int
+	var peerBody string
+	peerSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(peerStatus)
+		w.Write([]byte(peerBody))
+	}))
+	defer peerSrv.Close()
+
+	peerURL, _ := url.Parse(peerSrv.URL)
+	cfg := config.Config{
+		HealthCheckTimeout: 15,
+		Peers: map[string]config.PeerConfig{
+			"gem": {Proxy: peerSrv.URL, ProxyURL: peerURL, Models: []string{"gemma-4-12b-256k"}},
+		},
+		LogLevel: "error",
+	}
+	proxy := New(cfg)
+
+	do := func(model string) (int, string) {
+		req := httptest.NewRequest("POST", "/models/unload", bytes.NewBufferString(`{"model":"`+model+`"}`))
+		w := CreateTestResponseRecorder()
+		proxy.ServeHTTP(w, req)
+		return w.Code, w.Body.String()
+	}
+
+	// already-cold (400 "not running") -> normalized to 200 already_unloaded, both forms
+	peerStatus, peerBody = http.StatusBadRequest, `{"error":{"message":"model is not running"}}`
+	code, body := do("gemma-4-12b-256k@gem")
+	assert.Equal(t, http.StatusOK, code, "@peer not-running must normalize to 200")
+	assert.Contains(t, body, "already_unloaded")
+	code, body = do("gemma-4-12b-256k")
+	assert.Equal(t, http.StatusOK, code, "bare not-running must normalize to 200")
+	assert.Contains(t, body, "already_unloaded")
+
+	// genuinely-unknown (400 "not found") -> passed through, NOT masked
+	peerStatus, peerBody = http.StatusBadRequest, `{"error":{"message":"model is not found"}}`
+	code, body = do("gemma-4-12b-256k@gem")
+	assert.Equal(t, http.StatusBadRequest, code, "not-found must pass through")
+	assert.Contains(t, body, "not found")
+
+	// success passes through untouched
+	peerStatus, peerBody = http.StatusOK, `{"success":true}`
+	code, body = do("gemma-4-12b-256k@gem")
+	assert.Equal(t, http.StatusOK, code)
+	assert.Contains(t, body, "success")
+}
+
 func TestProxyManager_UnloadSingleModel(t *testing.T) {
 	const testGroupId = "testGroup"
 	config := config.AddDefaultGroupToConfig(config.Config{

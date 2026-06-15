@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -86,9 +87,9 @@ func (pm *ProxyManager) routerUnloadHandler(c *gin.Context) {
 		// Pinned peer (e.g. gemma-4-12b-256k@gem) -> forward to that node.
 		if res.PeerID != "" {
 			pm.rebody(c, bodyBytes)
-			if perr := pm.peerProxy.ProxyRequestToPeer(res.PeerID, res.Model, c.Writer, c.Request); perr != nil {
-				pm.sendErrorResponse(c, http.StatusBadGateway, fmt.Sprintf("error forwarding unload to peer %s: %s", res.PeerID, perr.Error()))
-			}
+			pm.forwardUnloadNormalized(c, "peer "+res.PeerID, func(w http.ResponseWriter) error {
+				return pm.peerProxy.ProxyRequestToPeer(res.PeerID, res.Model, w, c.Request)
+			})
 			return
 		}
 	}
@@ -111,14 +112,64 @@ func (pm *ProxyManager) routerUnloadHandler(c *gin.Context) {
 	// Model lives on a peer (named, not node-pinned) -> forward to that peer.
 	if pm.peerProxy != nil && pm.peerProxy.HasPeerModel(requestedModel) {
 		pm.rebody(c, bodyBytes)
-		if perr := pm.peerProxy.ProxyRequest(requestedModel, c.Writer, c.Request); perr != nil {
-			pm.sendErrorResponse(c, http.StatusBadGateway, fmt.Sprintf("error forwarding unload for model %s: %s", requestedModel, perr.Error()))
-		}
+		pm.forwardUnloadNormalized(c, "model "+requestedModel, func(w http.ResponseWriter) error {
+			return pm.peerProxy.ProxyRequest(requestedModel, w, c.Request)
+		})
 		return
 	}
 
 	pm.sendErrorResponse(c, http.StatusNotFound, "model not found")
 }
+
+// unloadNotRunningRe matches a peer router's "already cold" unload response. The
+// native llama.cpp router returns 4xx "model is not running" for a CONFIGURED
+// model that isn't loaded. We deliberately do NOT match "not found": that means
+// an unknown model id — a real error we must surface, not mask as success.
+var unloadNotRunningRe = regexp.MustCompile(`(?i)not running`)
+
+// forwardUnloadNormalized dispatches an unload to a peer but BUFFERS the response
+// so an already-cold model on a peer router that lacks idempotent-unload (4xx
+// "model is not running") is normalized to 200 {success,already_unloaded}. This
+// makes pool unload idempotent regardless of the peer router version (mirrors the
+// node-router idempotent-unload contract at the pool layer). Unload responses are
+// tiny non-streaming JSON, so buffering has no perf cost.
+func (pm *ProxyManager) forwardUnloadNormalized(c *gin.Context, who string, dispatch func(http.ResponseWriter) error) {
+	buf := newBufferedResponse()
+	if err := dispatch(buf); err != nil {
+		pm.sendErrorResponse(c, http.StatusBadGateway, fmt.Sprintf("error forwarding unload to %s: %s", who, err.Error()))
+		return
+	}
+	body := buf.body.Bytes()
+	if buf.code >= 400 && unloadNotRunningRe.Match(body) {
+		pm.proxyLogger.Debugf("unload: normalizing %s %d 'not running' -> 200 already_unloaded", who, buf.code)
+		c.JSON(http.StatusOK, gin.H{"success": true, "already_unloaded": true})
+		return
+	}
+	// Pass the peer's response through unchanged.
+	for k, vals := range buf.header {
+		for _, v := range vals {
+			c.Writer.Header().Add(k, v)
+		}
+	}
+	c.Writer.WriteHeader(buf.code)
+	_, _ = c.Writer.Write(body)
+}
+
+// bufferedResponse is a minimal in-memory http.ResponseWriter used to capture a
+// peer's (small, non-streaming) unload response before deciding to normalize it.
+type bufferedResponse struct {
+	header http.Header
+	body   bytes.Buffer
+	code   int
+}
+
+func newBufferedResponse() *bufferedResponse {
+	return &bufferedResponse{header: make(http.Header), code: http.StatusOK}
+}
+
+func (b *bufferedResponse) Header() http.Header         { return b.header }
+func (b *bufferedResponse) WriteHeader(code int)        { b.code = code }
+func (b *bufferedResponse) Write(p []byte) (int, error) { return b.body.Write(p) }
 
 // rebody resets the request body (and its length headers) so a reverse-proxy
 // dispatch re-sends the possibly-rewritten bytes. Mirrors proxyInferenceHandler.
