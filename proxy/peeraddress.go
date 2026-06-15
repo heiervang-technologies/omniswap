@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"sort"
 	"strings"
 	"time"
 
@@ -24,6 +25,19 @@ import (
 //	gemma-4-12b@crystal    -> pin to node "crystal", use model "gemma-4-12b"
 //	any@crystal / @crystal -> pin to node "crystal", use whatever it has loaded
 //	any / @ / any@any / "" -> first node (deterministic order) with a loaded model
+//
+// The model axis also accepts a modality-capability expression instead of a
+// concrete id — `any[<in>]to[<out>]` (the `any` prefix is optional) — which
+// resolves to a peer model whose advertised input_modalities ⊇ <in> and
+// output_modalities ⊇ <out>. Combine with @node to constrain to one node:
+//
+//	any[text,image]to[text]        -> any node's first vision-capable LLM
+//	[text,image,audio]to[text]@titan -> an omni-input model on node "titan"
+//	any[text]to[image]             -> (no LLM peer produces image -> 503; that
+//	                                   modality lives on comfy-openai's endpoint)
+//
+// An empty bracket set is an unconstrained axis. Capability resolution prefers
+// an already-loaded match (no cold swap), else cold-loads a matching model.
 //
 // Hard rule: node names are only ever valid to the right of '@'. A bare token
 // (no '@') is always a model and is never interpreted as a node.
@@ -64,12 +78,21 @@ type AddressResolution struct {
 	Rewrote bool
 }
 
+// modelModality is a peer model's advertised input/output modality signature,
+// lifted from its /v1/models `architecture` block. Propagated through the
+// aggregated union so clients can group/route by capability (vision, omni, etc.).
+type modelModality struct {
+	Input  []string
+	Output []string
+}
+
 // peerLoadedSet is a short-lived snapshot of one peer's advertised models.
 type peerLoadedSet struct {
-	order     []string        // loaded model ids, in the order the peer listed them
-	all       map[string]bool // loaded ids + their aliases, for membership checks
-	served    map[string]bool // ALL advertised ids + aliases (loaded or cold), for routing
-	fetchedAt time.Time
+	order      []string                 // loaded model ids, in the order the peer listed them
+	all        map[string]bool          // loaded ids + their aliases, for membership checks
+	served     map[string]bool          // ALL advertised ids + aliases (loaded or cold), for routing
+	modalities map[string]modelModality // id/alias -> advertised modality (only when the peer reports one)
+	fetchedAt  time.Time
 }
 
 // isWildcard reports whether a model/node component means "any" — either empty
@@ -102,6 +125,16 @@ func (p *PeerProxy) ResolveAddress(raw string) (AddressResolution, error) {
 	model, node, hasAt, err := splitAddress(raw)
 	if err != nil {
 		return AddressResolution{}, err
+	}
+
+	// Modality-capability model expression (`any[in]to[out]`): resolve to a
+	// concrete peer model whose advertised caps satisfy the request, optionally
+	// pinned to @node. Intercepted before wildcard handling because the bracket
+	// form is neither a plain id nor the bare `any` wildcard.
+	if reqIn, reqOut, isCap, capErr := parseCapability(model); capErr != nil {
+		return AddressResolution{}, capErr
+	} else if isCap {
+		return p.resolveCapability(node, isWildcard(node), reqIn, reqOut)
 	}
 
 	modelWild := isWildcard(model)
@@ -201,6 +234,129 @@ func (p *PeerProxy) firstLoadedAnywhere() (peerID, model string, ok bool) {
 	return "", "", false
 }
 
+// parseCapability detects and parses a modality-capability model expression of
+// the form `any[in1,in2]to[out1,out2]` (the `any` prefix is optional). Returns
+// the requested input/output modality sets (empty = unconstrained on that axis)
+// and ok=true when raw is such an expression. A plain model id or the bare
+// `any` wildcard returns ok=false so the caller falls back to id/wildcard
+// resolution. Modality tokens are lowercased (text/image/audio/video).
+func parseCapability(raw string) (reqIn, reqOut []string, ok bool, err error) {
+	s := strings.ToLower(strings.TrimSpace(raw))
+	s = strings.TrimSpace(strings.TrimPrefix(s, anyAlias))
+	if !strings.HasPrefix(s, "[") {
+		return nil, nil, false, nil // not a capability expression
+	}
+	bad := func() (s []string, r []string, ok bool, e error) {
+		return nil, nil, false, &addrError{
+			code: http.StatusBadRequest,
+			msg:  fmt.Sprintf("invalid capability address %q: expected any[<in>]to[<out>]", raw),
+		}
+	}
+	c1 := strings.IndexByte(s, ']')
+	if c1 < 0 {
+		return bad()
+	}
+	rest := strings.TrimSpace(s[c1+1:])
+	if !strings.HasPrefix(rest, "to") {
+		return bad()
+	}
+	rest = strings.TrimSpace(strings.TrimPrefix(rest, "to"))
+	if !strings.HasPrefix(rest, "[") || !strings.HasSuffix(rest, "]") {
+		return bad()
+	}
+	return splitModalityCSV(s[1:c1]), splitModalityCSV(rest[1 : len(rest)-1]), true, nil
+}
+
+func splitModalityCSV(s string) []string {
+	out := []string{}
+	for _, t := range strings.Split(s, ",") {
+		if t = strings.TrimSpace(t); t != "" {
+			out = append(out, t)
+		}
+	}
+	return out
+}
+
+// modalitySatisfies reports whether a model's advertised modality covers the
+// request: every requested input modality is in mod.Input and every requested
+// output modality is in mod.Output. An empty request set is unconstrained.
+func modalitySatisfies(mod modelModality, reqIn, reqOut []string) bool {
+	return containsAllFold(mod.Input, reqIn) && containsAllFold(mod.Output, reqOut)
+}
+
+func containsAllFold(have, want []string) bool {
+	for _, w := range want {
+		found := false
+		for _, h := range have {
+			if strings.EqualFold(h, w) {
+				found = true
+				break
+			}
+		}
+		if !found {
+			return false
+		}
+	}
+	return true
+}
+
+// firstModelMatchingCaps returns a model on the peer whose advertised modality
+// satisfies the request, preferring an already-loaded model (no cold swap),
+// else a cold-but-advertised one (resolved deterministically). Only models the
+// peer advertises a modality signature for are eligible.
+func (p *PeerProxy) firstModelMatchingCaps(peerID string, peer config.PeerConfig, reqIn, reqOut []string) (string, bool) {
+	loaded := p.peerLoaded(peerID, peer)
+	for _, id := range loaded.order { // prefer loaded, in advertised order
+		if mod, ok := loaded.modalities[id]; ok && modalitySatisfies(mod, reqIn, reqOut) {
+			return id, true
+		}
+	}
+	ids := make([]string, 0, len(loaded.modalities))
+	for id := range loaded.modalities {
+		ids = append(ids, id)
+	}
+	sort.Strings(ids)
+	for _, id := range ids {
+		if mod := loaded.modalities[id]; modalitySatisfies(mod, reqIn, reqOut) {
+			return id, true
+		}
+	}
+	return "", false
+}
+
+// resolveCapability resolves a modality-capability address to a concrete
+// PeerID+Model. With a wildcard node it scans peers in deterministic order;
+// with a concrete node it constrains to that node.
+func (p *PeerProxy) resolveCapability(node string, nodeWild bool, reqIn, reqOut []string) (AddressResolution, error) {
+	desc := fmt.Sprintf("[%s]to[%s]", strings.Join(reqIn, ","), strings.Join(reqOut, ","))
+	if nodeWild {
+		for _, peerID := range p.peerOrder {
+			peer := p.peers[peerID]
+			if picked, ok := p.firstModelMatchingCaps(peerID, peer, reqIn, reqOut); ok {
+				return AddressResolution{PeerID: peerID, Model: picked, Rewrote: true}, nil
+			}
+		}
+		return AddressResolution{}, &addrError{
+			code: http.StatusServiceUnavailable,
+			msg:  fmt.Sprintf("no peer has a model satisfying capability %s", desc),
+		}
+	}
+	peer, ok := p.peers[node]
+	if !ok {
+		return AddressResolution{}, &addrError{
+			code: http.StatusBadRequest,
+			msg:  fmt.Sprintf("unknown node %q (known nodes: %s)", node, strings.Join(p.peerOrder, ", ")),
+		}
+	}
+	if picked, ok := p.firstModelMatchingCaps(node, peer, reqIn, reqOut); ok {
+		return AddressResolution{PeerID: node, Model: picked, Rewrote: true}, nil
+	}
+	return AddressResolution{}, &addrError{
+		code: http.StatusServiceUnavailable,
+		msg:  fmt.Sprintf("node %q has no model satisfying capability %s", node, desc),
+	}
+}
+
 // LoadedModels returns the currently-loaded model ids for a peer, used by the
 // /v1/models listing to surface `<model>@<node>` ids for discovery.
 func (p *PeerProxy) LoadedModels(peerID string) []string {
@@ -227,6 +383,23 @@ func (p *PeerProxy) IsPeerModelLoaded(peerID, modelID string) bool {
 		return false
 	}
 	return p.peerLoaded(peerID, peer).all[modelID]
+}
+
+// PeerModelModality returns the input/output modality signature a peer advertises
+// for modelID (from its /v1/models `architecture` block), if any. Reads the same
+// short-TTL cache as the loaded-status stamping, so it costs no extra peer poll.
+// Used by the /v1/models union to propagate capability metadata that the bare
+// peer model-id list would otherwise drop.
+func (p *PeerProxy) PeerModelModality(peerID, modelID string) (input, output []string, ok bool) {
+	peer, found := p.peers[peerID]
+	if !found {
+		return nil, nil, false
+	}
+	mod, ok := p.peerLoaded(peerID, peer).modalities[modelID]
+	if !ok {
+		return nil, nil, false
+	}
+	return mod.Input, mod.Output, true
 }
 
 // peerLoaded returns a short-TTL snapshot of the peer's loaded models, querying
@@ -299,6 +472,10 @@ type modelsListPayload struct {
 		Status  *struct {
 			Value string `json:"value"`
 		} `json:"status"`
+		Architecture *struct {
+			InputModalities  []string `json:"input_modalities"`
+			OutputModalities []string `json:"output_modalities"`
+		} `json:"architecture"`
 	} `json:"data"`
 }
 
@@ -308,7 +485,7 @@ type modelsListPayload struct {
 // (a plain llama-server) or status.value == "loaded" — additionally populates
 // `order`/`all` (the loaded set surfaced as hot ids and `<id>@<node>` aliases).
 func parseLoadedModels(body []byte, at time.Time) peerLoadedSet {
-	set := peerLoadedSet{all: map[string]bool{}, served: map[string]bool{}, fetchedAt: at}
+	set := peerLoadedSet{all: map[string]bool{}, served: map[string]bool{}, modalities: map[string]modelModality{}, fetchedAt: at}
 	var payload modelsListPayload
 	if err := json.Unmarshal(body, &payload); err != nil {
 		return set
@@ -322,6 +499,18 @@ func parseLoadedModels(body []byte, at time.Time) peerLoadedSet {
 		for _, a := range m.Aliases {
 			if a != "" {
 				set.served[a] = true
+			}
+		}
+		// Capture the advertised modality signature (independent of loaded
+		// status — a cold model still has a fixed capability). Keyed by id and
+		// every alias so a union lookup hits regardless of which name is used.
+		if m.Architecture != nil && (len(m.Architecture.InputModalities) > 0 || len(m.Architecture.OutputModalities) > 0) {
+			mod := modelModality{Input: m.Architecture.InputModalities, Output: m.Architecture.OutputModalities}
+			set.modalities[m.ID] = mod
+			for _, a := range m.Aliases {
+				if a != "" {
+					set.modalities[a] = mod
+				}
 			}
 		}
 		// Only resident models count as "loaded".
