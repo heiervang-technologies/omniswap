@@ -1,15 +1,20 @@
 package proxy
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"sort"
+	"strconv"
 	"strings"
 
 	"github.com/gin-gonic/gin"
 	"github.com/mostlygeek/llama-swap/event"
+	"github.com/tidwall/gjson"
+	"github.com/tidwall/sjson"
 )
 
 type Model struct {
@@ -37,6 +42,91 @@ func addApiHandlers(pm *ProxyManager) {
 func (pm *ProxyManager) apiUnloadAllModels(c *gin.Context) {
 	pm.StopProcesses(StopImmediately)
 	c.JSON(http.StatusOK, gin.H{"msg": "ok"})
+}
+
+// routerUnloadHandler implements POST /models/unload with the SAME contract as
+// the native llama.cpp router ({"model":"<id>"} -> {"success":true}). Unlike the
+// /api unload handlers it PROPAGATES the unload to the peer that owns the model,
+// so a model loaded on a remote node (e.g. a gem) can be unloaded from the
+// cluster pool — which is what heierchat's unload button needs. The forwarded
+// request keeps the /models/unload path, which every peer (native router or a
+// nested pool) also serves, and the peer's own response (success, or "model is
+// not running") is streamed straight back to the caller.
+func (pm *ProxyManager) routerUnloadHandler(c *gin.Context) {
+	bodyBytes, err := io.ReadAll(c.Request.Body)
+	if err != nil {
+		pm.sendErrorResponse(c, http.StatusBadRequest, "could not read request body")
+		return
+	}
+	requestedModel := gjson.GetBytes(bodyBytes, "model").String()
+
+	// No specific model => unload all LOCAL processes. Peers have no unload-all
+	// route (their models LRU-evict), so we don't fan out here.
+	if requestedModel == "" {
+		pm.StopProcesses(StopImmediately)
+		c.JSON(http.StatusOK, gin.H{"success": true})
+		return
+	}
+
+	// Resolve <model>@<node> addressing, mirroring proxyInferenceHandler so the
+	// unload path routes identically to the inference path.
+	if pm.peerProxy != nil {
+		res, rerr := pm.peerProxy.ResolveAddress(requestedModel)
+		if rerr != nil {
+			pm.sendErrorResponse(c, addrErrorCode(rerr), rerr.Error())
+			return
+		}
+		if res.Rewrote {
+			if bodyBytes, err = sjson.SetBytes(bodyBytes, "model", res.Model); err != nil {
+				pm.sendErrorResponse(c, http.StatusInternalServerError, fmt.Sprintf("error rewriting model name: %s", err.Error()))
+				return
+			}
+		}
+		requestedModel = res.Model
+		// Pinned peer (e.g. gemma-4-12b-256k@gem) -> forward to that node.
+		if res.PeerID != "" {
+			pm.rebody(c, bodyBytes)
+			if perr := pm.peerProxy.ProxyRequestToPeer(res.PeerID, res.Model, c.Writer, c.Request); perr != nil {
+				pm.sendErrorResponse(c, http.StatusBadGateway, fmt.Sprintf("error forwarding unload to peer %s: %s", res.PeerID, perr.Error()))
+			}
+			return
+		}
+	}
+
+	// Local model -> stop it here.
+	if localID, found := pm.config.RealModelName(requestedModel); found {
+		processGroup := pm.findGroupByModelName(localID)
+		if processGroup == nil {
+			pm.sendErrorResponse(c, http.StatusInternalServerError, fmt.Sprintf("process group not found for model %s", requestedModel))
+			return
+		}
+		if serr := processGroup.StopProcess(localID, StopImmediately); serr != nil {
+			pm.sendErrorResponse(c, http.StatusInternalServerError, fmt.Sprintf("error stopping process: %s", serr.Error()))
+			return
+		}
+		c.JSON(http.StatusOK, gin.H{"success": true})
+		return
+	}
+
+	// Model lives on a peer (named, not node-pinned) -> forward to that peer.
+	if pm.peerProxy != nil && pm.peerProxy.HasPeerModel(requestedModel) {
+		pm.rebody(c, bodyBytes)
+		if perr := pm.peerProxy.ProxyRequest(requestedModel, c.Writer, c.Request); perr != nil {
+			pm.sendErrorResponse(c, http.StatusBadGateway, fmt.Sprintf("error forwarding unload for model %s: %s", requestedModel, perr.Error()))
+		}
+		return
+	}
+
+	pm.sendErrorResponse(c, http.StatusNotFound, "model not found")
+}
+
+// rebody resets the request body (and its length headers) so a reverse-proxy
+// dispatch re-sends the possibly-rewritten bytes. Mirrors proxyInferenceHandler.
+func (pm *ProxyManager) rebody(c *gin.Context, bodyBytes []byte) {
+	c.Request.Body = io.NopCloser(bytes.NewBuffer(bodyBytes))
+	c.Request.Header.Del("transfer-encoding")
+	c.Request.Header.Set("content-length", strconv.Itoa(len(bodyBytes)))
+	c.Request.ContentLength = int64(len(bodyBytes))
 }
 
 func (pm *ProxyManager) getModelStatus() []Model {

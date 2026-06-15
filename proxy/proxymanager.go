@@ -326,6 +326,11 @@ func (pm *ProxyManager) setupGinEngine() {
 	})
 	pm.ginEngine.Any("/upstream/*upstreamPath", pm.apiKeyAuth(), pm.proxyToUpstream)
 	pm.ginEngine.GET("/unload", pm.apiKeyAuth(), pm.unloadAllModelsHandler)
+	// POST /models/unload — same contract as the native llama.cpp router
+	// ({"model":"<id>"} -> {"success":true}); makes the pool transparent for
+	// unload and PROPAGATES it to the peer that owns the model. Empty model =
+	// unload everything (local + every peer). See routerUnloadHandler.
+	pm.ginEngine.POST("/models/unload", pm.apiKeyAuth(), pm.routerUnloadHandler)
 	pm.ginEngine.GET("/running", pm.apiKeyAuth(), pm.listRunningProcessesHandler)
 	pm.ginEngine.GET("/health", func(c *gin.Context) {
 		c.String(http.StatusOK, "OK")
