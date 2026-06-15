@@ -86,12 +86,26 @@ type modelModality struct {
 	Output []string
 }
 
+// modelDims is a peer model's size/context dimensions, lifted from its
+// /v1/models `meta` block (the node router populates it once the model is
+// loaded). Propagated through the union so the picker UI can show a
+// context-length slider + compute VRAM feasibility. Zero values mean the peer
+// hasn't reported that field (e.g. a never-loaded cold model).
+type modelDims struct {
+	NCtx        int64 // currently-loaded context window
+	NCtxTrain   int64 // max context the model was trained for (slider max)
+	WeightBytes int64 // weights size on disk/VRAM (meta.size)
+	NParams     int64
+	NEmbd       int64
+}
+
 // peerLoadedSet is a short-lived snapshot of one peer's advertised models.
 type peerLoadedSet struct {
 	order      []string                 // loaded model ids, in the order the peer listed them
 	all        map[string]bool          // loaded ids + their aliases, for membership checks
 	served     map[string]bool          // ALL advertised ids + aliases (loaded or cold), for routing
 	modalities map[string]modelModality // id/alias -> advertised modality (only when the peer reports one)
+	dims       map[string]modelDims     // id/alias -> size/context dims (only when the peer reports meta)
 	fetchedAt  time.Time
 }
 
@@ -402,6 +416,19 @@ func (p *PeerProxy) PeerModelModality(peerID, modelID string) (input, output []s
 	return mod.Input, mod.Output, true
 }
 
+// PeerModelDims returns the size/context dimensions a peer reports for modelID
+// (from its /v1/models `meta` block), if any. Reads the same short-TTL cache as
+// the loaded-status stamping, so it costs no extra peer poll. The node router
+// only populates meta once a model is loaded, so cold models return ok=false.
+func (p *PeerProxy) PeerModelDims(peerID, modelID string) (modelDims, bool) {
+	peer, found := p.peers[peerID]
+	if !found {
+		return modelDims{}, false
+	}
+	d, ok := p.peerLoaded(peerID, peer).dims[modelID]
+	return d, ok
+}
+
 // peerLoaded returns a short-TTL snapshot of the peer's loaded models, querying
 // the peer's /v1/models when the cache is stale. On query failure it keeps the
 // previous snapshot for one more cycle, else returns an empty (but timestamped)
@@ -476,6 +503,13 @@ type modelsListPayload struct {
 			InputModalities  []string `json:"input_modalities"`
 			OutputModalities []string `json:"output_modalities"`
 		} `json:"architecture"`
+		Meta *struct {
+			NCtx      int64 `json:"n_ctx"`
+			NCtxTrain int64 `json:"n_ctx_train"`
+			Size      int64 `json:"size"`
+			NParams   int64 `json:"n_params"`
+			NEmbd     int64 `json:"n_embd"`
+		} `json:"meta"`
 	} `json:"data"`
 }
 
@@ -485,7 +519,7 @@ type modelsListPayload struct {
 // (a plain llama-server) or status.value == "loaded" — additionally populates
 // `order`/`all` (the loaded set surfaced as hot ids and `<id>@<node>` aliases).
 func parseLoadedModels(body []byte, at time.Time) peerLoadedSet {
-	set := peerLoadedSet{all: map[string]bool{}, served: map[string]bool{}, modalities: map[string]modelModality{}, fetchedAt: at}
+	set := peerLoadedSet{all: map[string]bool{}, served: map[string]bool{}, modalities: map[string]modelModality{}, dims: map[string]modelDims{}, fetchedAt: at}
 	var payload modelsListPayload
 	if err := json.Unmarshal(body, &payload); err != nil {
 		return set
@@ -510,6 +544,23 @@ func parseLoadedModels(body []byte, at time.Time) peerLoadedSet {
 			for _, a := range m.Aliases {
 				if a != "" {
 					set.modalities[a] = mod
+				}
+			}
+		}
+		// Capture size/context dims from the model meta (the node router fills
+		// these on load; cold models report an empty meta and are skipped).
+		if m.Meta != nil && (m.Meta.NCtxTrain > 0 || m.Meta.Size > 0) {
+			dim := modelDims{
+				NCtx:        m.Meta.NCtx,
+				NCtxTrain:   m.Meta.NCtxTrain,
+				WeightBytes: m.Meta.Size,
+				NParams:     m.Meta.NParams,
+				NEmbd:       m.Meta.NEmbd,
+			}
+			set.dims[m.ID] = dim
+			for _, a := range m.Aliases {
+				if a != "" {
+					set.dims[a] = dim
 				}
 			}
 		}

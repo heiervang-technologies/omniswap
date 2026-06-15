@@ -531,6 +531,22 @@ func (pm *ProxyManager) listModelsHandler(c *gin.Context) {
 					}
 				}
 
+				// Propagate size/context dims (from the node-router model meta)
+				// into meta.llamaswap so the picker can show a context slider
+				// + compute VRAM feasibility. Loaded models only (cold report
+				// no meta upstream — see PeerModelDims).
+				if dim, ok := pm.peerProxy.PeerModelDims(peerID, modelID); ok {
+					if meta, mok := record["meta"].(gin.H); mok {
+						if ls, lok := meta["llamaswap"].(map[string]any); lok {
+							ls["n_ctx"] = dim.NCtx
+							ls["n_ctx_train"] = dim.NCtxTrain
+							ls["weights_bytes"] = dim.WeightBytes
+							ls["n_params"] = dim.NParams
+							ls["n_embd"] = dim.NEmbd
+						}
+					}
+				}
+
 				data = append(data, record)
 			}
 		}
