@@ -76,9 +76,9 @@ func TestSplitAddress(t *testing.T) {
 func TestResolveAddress(t *testing.T) {
 	p := newTestPeerProxy()
 	cases := []struct {
-		in     string
-		peerID string
-		model  string
+		in      string
+		peerID  string
+		model   string
 		rewrote bool
 	}{
 		// concrete model, any node -> existing behaviour
@@ -214,7 +214,8 @@ func eqStrSlice(a, b []string) bool {
 func TestParseLoadedModelsDims(t *testing.T) {
 	body := []byte(`{"data":[
 		{"id":"gemma-4-12b","aliases":["omni"],"status":{"value":"loaded"},
-		 "meta":{"n_ctx":32768,"n_ctx_train":131072,"size":7441934504,"n_params":7518069290,"n_embd":2560}},
+		 "meta":{"n_ctx":32768,"n_ctx_train":131072,"size":7441934504,"n_params":7518069290,"n_embd":2560,
+		         "n_layer":48,"n_head_kv":8,"n_embd_k_gqa":640,"n_embd_v_gqa":640,"cache_type_k":"q8_0","cache_type_v":"q8_0"}},
 		{"id":"cold-no-meta","status":{"value":"unloaded"}},
 		{"id":"cold-empty-meta","status":{"value":"unloaded"},"meta":{"n_ctx":0,"n_ctx_train":0}}
 	]}`)
@@ -223,6 +224,10 @@ func TestParseLoadedModelsDims(t *testing.T) {
 	d, ok := set.dims["gemma-4-12b"]
 	if !ok || d.NCtx != 32768 || d.NCtxTrain != 131072 || d.WeightBytes != 7441934504 || d.NEmbd != 2560 {
 		t.Fatalf("dims not captured correctly: %+v ok=%v", d, ok)
+	}
+	// KV geometry + cache quant for exact KV bytes/token.
+	if d.NLayer != 48 || d.NHeadKV != 8 || d.NEmbdKGqa != 640 || d.NEmbdVGqa != 640 || d.CacheTypeK != "q8_0" || d.CacheTypeV != "q8_0" {
+		t.Errorf("KV dims not captured correctly: %+v", d)
 	}
 	if a, ok := set.dims["omni"]; !ok || a.NCtxTrain != 131072 {
 		t.Error("expected alias 'omni' to carry the same dims")
