@@ -10,6 +10,7 @@ import (
 	"mime/multipart"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strconv"
 	"strings"
 	"sync"
@@ -719,6 +720,56 @@ func TestProxyManager_Unload(t *testing.T) {
 		t.Fatal("timeout waiting for model1 to stop")
 	}
 	assert.Equal(t, proxy.processGroups[config.DEFAULT_GROUP_ID].processes["model1"].CurrentState(), StateStopped)
+}
+
+// POST /models/unload must PROPAGATE to the peer that owns the model — both for
+// a named peer model and a node-pinned <model>@<node> address (with @node
+// stripped before forwarding). Regression guard for the "can't unload a gem
+// model from the pool" bug.
+func TestProxyManager_RouterUnload_ForwardsToPeer(t *testing.T) {
+	var gotPath, gotBody string
+	peerSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotPath = r.URL.Path
+		buf := new(bytes.Buffer)
+		buf.ReadFrom(r.Body)
+		gotBody = buf.String()
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte(`{"success":true}`))
+	}))
+	defer peerSrv.Close()
+
+	peerURL, _ := url.Parse(peerSrv.URL)
+	cfg := config.Config{
+		HealthCheckTimeout: 15,
+		Peers: map[string]config.PeerConfig{
+			"gem": {
+				Proxy:    peerSrv.URL,
+				ProxyURL: peerURL, // struct-literal config skips the YAML Proxy->ProxyURL parse
+				Models:   []string{"gemma-4-12b-256k"},
+			},
+		},
+		LogLevel: "error",
+	}
+	proxy := New(cfg)
+
+	// (1) named peer model -> forwarded to the owning peer, same /models/unload path.
+	req := httptest.NewRequest("POST", "/models/unload", bytes.NewBufferString(`{"model":"gemma-4-12b-256k"}`))
+	w := CreateTestResponseRecorder()
+	proxy.ServeHTTP(w, req)
+	assert.Equal(t, http.StatusOK, w.Code)
+	assert.Equal(t, "/models/unload", gotPath)
+	assert.Contains(t, gotBody, "gemma-4-12b-256k")
+	assert.Equal(t, `{"success":true}`, w.Body.String())
+
+	// (2) node-pinned address: @gem is stripped from the forwarded body.
+	gotPath, gotBody = "", ""
+	req = httptest.NewRequest("POST", "/models/unload", bytes.NewBufferString(`{"model":"gemma-4-12b-256k@gem"}`))
+	w = CreateTestResponseRecorder()
+	proxy.ServeHTTP(w, req)
+	assert.Equal(t, http.StatusOK, w.Code)
+	assert.Equal(t, "/models/unload", gotPath)
+	assert.Contains(t, gotBody, `"gemma-4-12b-256k"`)
+	assert.NotContains(t, gotBody, "@gem")
 }
 
 func TestProxyManager_UnloadSingleModel(t *testing.T) {
