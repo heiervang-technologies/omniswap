@@ -511,6 +511,16 @@ func (pm *ProxyManager) listModelsHandler(c *gin.Context) {
 					record["status"] = gin.H{"value": "loaded"}
 				}
 
+				// Expose the node name (= peerID for node-router peers) so the FE
+				// can resolve per-node VRAM from gpu-metrics-api/DCGM. A
+				// cross-cluster federated peer won't match the home DCGM,
+				// which is correct — its VRAM lives on another cluster.
+				if meta, mok := record["meta"].(gin.H); mok {
+					if ls, lok := meta["llamaswap"].(map[string]any); lok {
+						ls["node_name"] = peerID
+					}
+				}
+
 				// Propagate the peer's advertised modality signature so clients
 				// can group/route by capability (vision, omni, image-out, ...).
 				// The bare peer model-id list drops the source node-router's
@@ -543,6 +553,13 @@ func (pm *ProxyManager) listModelsHandler(c *gin.Context) {
 							ls["weights_bytes"] = dim.WeightBytes
 							ls["n_params"] = dim.NParams
 							ls["n_embd"] = dim.NEmbd
+							// KV geometry + live cache quant → exact KV bytes/token.
+							ls["n_layer"] = dim.NLayer
+							ls["n_head_kv"] = dim.NHeadKV
+							ls["n_embd_k_gqa"] = dim.NEmbdKGqa
+							ls["n_embd_v_gqa"] = dim.NEmbdVGqa
+							ls["cache_type_k"] = dim.CacheTypeK
+							ls["cache_type_v"] = dim.CacheTypeV
 						}
 					}
 				}

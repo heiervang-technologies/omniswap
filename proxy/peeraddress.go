@@ -97,6 +97,14 @@ type modelDims struct {
 	WeightBytes int64 // weights size on disk/VRAM (meta.size)
 	NParams     int64
 	NEmbd       int64
+	// KV-cache geometry + configured quant so clients can compute exact KV
+	// bytes/token = NLayer*(NEmbdKGqa+NEmbdVGqa)*kv_type_size.
+	NLayer     int64
+	NHeadKV    int64
+	NEmbdKGqa  int64
+	NEmbdVGqa  int64
+	CacheTypeK string // e.g. "f16", "q8_0", "q4_0"
+	CacheTypeV string
 }
 
 // peerLoadedSet is a short-lived snapshot of one peer's advertised models.
@@ -504,11 +512,17 @@ type modelsListPayload struct {
 			OutputModalities []string `json:"output_modalities"`
 		} `json:"architecture"`
 		Meta *struct {
-			NCtx      int64 `json:"n_ctx"`
-			NCtxTrain int64 `json:"n_ctx_train"`
-			Size      int64 `json:"size"`
-			NParams   int64 `json:"n_params"`
-			NEmbd     int64 `json:"n_embd"`
+			NCtx       int64  `json:"n_ctx"`
+			NCtxTrain  int64  `json:"n_ctx_train"`
+			Size       int64  `json:"size"`
+			NParams    int64  `json:"n_params"`
+			NEmbd      int64  `json:"n_embd"`
+			NLayer     int64  `json:"n_layer"`
+			NHeadKV    int64  `json:"n_head_kv"`
+			NEmbdKGqa  int64  `json:"n_embd_k_gqa"`
+			NEmbdVGqa  int64  `json:"n_embd_v_gqa"`
+			CacheTypeK string `json:"cache_type_k"`
+			CacheTypeV string `json:"cache_type_v"`
 		} `json:"meta"`
 	} `json:"data"`
 }
@@ -556,6 +570,12 @@ func parseLoadedModels(body []byte, at time.Time) peerLoadedSet {
 				WeightBytes: m.Meta.Size,
 				NParams:     m.Meta.NParams,
 				NEmbd:       m.Meta.NEmbd,
+				NLayer:      m.Meta.NLayer,
+				NHeadKV:     m.Meta.NHeadKV,
+				NEmbdKGqa:   m.Meta.NEmbdKGqa,
+				NEmbdVGqa:   m.Meta.NEmbdVGqa,
+				CacheTypeK:  m.Meta.CacheTypeK,
+				CacheTypeV:  m.Meta.CacheTypeV,
 			}
 			set.dims[m.ID] = dim
 			for _, a := range m.Aliases {
