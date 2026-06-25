@@ -153,6 +153,19 @@ func TestPickPeerForModel(t *testing.T) {
 		assert.Equal(t, solo, p.pickPeerForModel("solo"))
 		assert.Nil(t, p.pickPeerForModel("absent"))
 	})
+
+	t.Run("reservation fans out repeated picks across equal peers", func(t *testing.T) {
+		// pickPeerForModel reserves (increments inFlight) the winner. Without a
+		// matching decrement between picks (i.e. requests still in flight), three
+		// equal warm peers should round-robin rather than all stampede the first.
+		p, _ := newP()
+		p.loadedCache["a"], p.loadedCache["b"], p.loadedCache["c"] = warm, warm, warm
+		var got []string
+		for i := 0; i < 6; i++ {
+			got = append(got, p.pickPeerForModel("m").peerID)
+		}
+		assert.Equal(t, []string{"a", "b", "c", "a", "b", "c"}, got)
+	})
 }
 
 func TestHasPeerModel(t *testing.T) {

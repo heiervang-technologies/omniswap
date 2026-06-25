@@ -40,6 +40,11 @@ type PeerProxy struct {
 	// resolution and error messages.
 	peerOrder []string
 
+	// selectMu serializes the rank-and-reserve step in pickPeerForModel so a
+	// simultaneous burst of by-name requests sees each other's reservations and
+	// fans out, instead of all reading inFlight==0 and stampeding the warm peer.
+	selectMu sync.Mutex
+
 	logger *LogMonitor
 
 	// loaded-state cache for resolving the `any` wildcard against what each
@@ -194,14 +199,16 @@ func (p *PeerProxy) ProxyRequest(model_id string, writer http.ResponseWriter, re
 		request.Header.Set("x-api-key", pp.apiKey)
 	}
 
-	atomic.AddInt64(&pp.inFlight, 1)
+	// pickPeerForModel already reserved (incremented inFlight on) pp; release it
+	// when the proxied request completes.
 	defer atomic.AddInt64(&pp.inFlight, -1)
 	pp.reverseProxy.ServeHTTP(writer, request)
 	return nil
 }
 
 // pickPeerForModel selects which peer serves modelID among all peers that list
-// it. One candidate -> return it. Several -> rank by
+// it, and RESERVES it (increments inFlight) so the caller must release with a
+// matching decrement. One candidate -> return it. Several -> rank by
 //
 //	rank = inFlight*2 + bias,  bias{warm:0, vacant:1, occupied-by-other:3}
 //
@@ -209,35 +216,48 @@ func (p *PeerProxy) ProxyRequest(model_id string, writer http.ResponseWriter, re
 // appended in sorted-peerID order and we keep the first on a tie). So a warm
 // idle peer always wins; a warm-but-busy peer yields to a vacant GPU (a one-time
 // cold-load, after which it too is warm); a peer running a different model is
-// evicted only when nothing better exists. Warm/loaded state is read from the
-// same short-TTL loadedCache the `@node`/`any` resolver uses (no extra polling).
+// evicted only when nothing better exists.
+//
+// The loaded-state bias is read from the same short-TTL loadedCache the
+// `@node`/`any` resolver uses (no extra polling), OUTSIDE the lock so a cache
+// miss never stalls other picks. The rank-and-reserve step runs under selectMu
+// so a simultaneous burst sees each other's reservations and fans out instead
+// of stampeding the warm peer (pick-then-increment must be atomic).
 func (p *PeerProxy) pickPeerForModel(modelID string) *peerProxyMember {
 	candidates := p.modelPeers[modelID]
-	switch len(candidates) {
-	case 0:
+	if len(candidates) == 0 {
 		return nil
-	case 1:
+	}
+	if len(candidates) == 1 {
+		atomic.AddInt64(&candidates[0].inFlight, 1)
 		return candidates[0]
 	}
 
-	var best *peerProxyMember
-	var bestKey int64
-	for _, pp := range candidates {
-		peer := p.peers[pp.peerID]
-		loaded := p.peerLoaded(pp.peerID, peer)
-		var bias int64
+	bias := make([]int64, len(candidates))
+	for i, pp := range candidates {
+		loaded := p.peerLoaded(pp.peerID, p.peers[pp.peerID])
 		switch {
 		case loaded.all[modelID]: // model resident here -> warm, no cold load
-			bias = 0
+			bias[i] = 0
 		case len(loaded.order) == 0: // nothing loaded -> cold-load onto a free GPU
-			bias = 1
+			bias[i] = 1
 		default: // a different model is resident -> cold-load needs an evict
-			bias = 3
+			bias[i] = 3
 		}
-		key := atomic.LoadInt64(&pp.inFlight)*2 + bias
+	}
+
+	p.selectMu.Lock()
+	defer p.selectMu.Unlock()
+	var best *peerProxyMember
+	var bestKey int64
+	for i, pp := range candidates {
+		key := atomic.LoadInt64(&pp.inFlight)*2 + bias[i]
 		if best == nil || key < bestKey {
 			best, bestKey = pp, key
 		}
+	}
+	if best != nil {
+		atomic.AddInt64(&best.inFlight, 1)
 	}
 	return best
 }
