@@ -54,6 +54,11 @@ func countryFromContext(r *http.Request) string {
 	return ctxStr(r, "country")
 }
 
+// ipFromContext reads the request's source IP (Cf-Connecting-Ip / ClientIP).
+func ipFromContext(r *http.Request) string {
+	return ctxStr(r, "ip")
+}
+
 func ctxStr(r *http.Request, key string) string {
 	if r == nil {
 		return ""
@@ -99,19 +104,33 @@ type clientUsage struct {
 	LastSeen     time.Time              `json:"last_seen"`
 }
 
-// usagePersist is the on-disk shape (clients + country rollups).
+// ipUsage is the per-source-IP rollup. Admin-only (IPs are PII); the real client
+// IP comes from Cloudflare's Cf-Connecting-Ip when via the tunnel.
+type ipUsage struct {
+	Requests     int64     `json:"requests"`
+	InputTokens  int64     `json:"input_tokens"`
+	OutputTokens int64     `json:"output_tokens"`
+	Client       string    `json:"client"`  // last key label seen from this IP
+	Country      string    `json:"country"` // last country seen
+	FirstSeen    time.Time `json:"first_seen"`
+	LastSeen     time.Time `json:"last_seen"`
+}
+
+// usagePersist is the on-disk shape (clients + country + ip rollups).
 type usagePersist struct {
 	Clients   map[string]*clientUsage `json:"clients"`
 	Countries map[string]*modelUsage  `json:"countries"`
+	IPs       map[string]*ipUsage     `json:"ips"`
 }
 
-// UsageMeter aggregates per-client (and per-country) token usage. Thread-safe;
-// persisted to disk.
+// UsageMeter aggregates per-client / per-country / per-IP token usage.
+// Thread-safe; persisted to disk.
 type UsageMeter struct {
 	mu        sync.Mutex
 	path      string
 	clients   map[string]*clientUsage
 	countries map[string]*modelUsage // ISO country (from Cf-IPCountry) -> totals
+	ips       map[string]*ipUsage    // source IP (Cf-Connecting-Ip / ClientIP) -> totals
 	dirty     bool
 	logger    *LogMonitor
 }
@@ -121,6 +140,7 @@ func NewUsageMeter(path string, logger *LogMonitor) *UsageMeter {
 		path:      path,
 		clients:   map[string]*clientUsage{},
 		countries: map[string]*modelUsage{},
+		ips:       map[string]*ipUsage{},
 		logger:    logger,
 	}
 	m.load()
@@ -146,16 +166,19 @@ func (m *UsageMeter) load() {
 		if snap.Countries != nil {
 			m.countries = snap.Countries
 		}
+		if snap.IPs != nil {
+			m.ips = snap.IPs
+		}
 		if m.logger != nil {
-			m.logger.Infof("usage meter: loaded %d clients / %d countries from %s", len(m.clients), len(m.countries), m.path)
+			m.logger.Infof("usage meter: loaded %d clients / %d countries / %d ips from %s", len(m.clients), len(m.countries), len(m.ips), m.path)
 		}
 	}
 }
 
-// Record attributes one completed request's token usage to a client and a
-// country (from Cf-IPCountry; "local" for LAN/no header). A zero/empty client is
-// bucketed as "unknown". Negative tokens (missing usage) clamp to 0.
-func (m *UsageMeter) Record(client, model, country string, inTok, outTok int) {
+// Record attributes one completed request's token usage to a client, a country
+// (Cf-IPCountry; "local" for LAN), and a source IP (Cf-Connecting-Ip/ClientIP).
+// Empty client -> "unknown". Negative tokens clamp to 0.
+func (m *UsageMeter) Record(client, model, country, ip string, inTok, outTok int) {
 	if client == "" {
 		client = "unknown"
 	}
@@ -164,6 +187,9 @@ func (m *UsageMeter) Record(client, model, country string, inTok, outTok int) {
 	}
 	if country == "" {
 		country = "local"
+	}
+	if ip == "" {
+		ip = "unknown"
 	}
 	if inTok < 0 {
 		inTok = 0
@@ -184,6 +210,18 @@ func (m *UsageMeter) Record(client, model, country string, inTok, outTok int) {
 	co.Requests++
 	co.InputTokens += int64(inTok)
 	co.OutputTokens += int64(outTok)
+
+	ipu := m.ips[ip]
+	if ipu == nil {
+		ipu = &ipUsage{FirstSeen: now}
+		m.ips[ip] = ipu
+	}
+	ipu.Requests++
+	ipu.InputTokens += int64(inTok)
+	ipu.OutputTokens += int64(outTok)
+	ipu.Client = client
+	ipu.Country = country
+	ipu.LastSeen = now
 
 	cu := m.clients[client]
 	if cu == nil {
@@ -234,6 +272,7 @@ func (m *UsageMeter) Snapshot() map[string]any {
 		"order":      order,
 		"clients":    m.clients,
 		"by_country": m.countries,
+		"by_ip":      m.ips,
 		"totals": map[string]int64{
 			"requests":      totReq,
 			"input_tokens":  totIn,
@@ -257,7 +296,7 @@ func (m *UsageMeter) flush() {
 		m.mu.Unlock()
 		return
 	}
-	b, err := json.MarshalIndent(usagePersist{Clients: m.clients, Countries: m.countries}, "", "  ")
+	b, err := json.MarshalIndent(usagePersist{Clients: m.clients, Countries: m.countries, IPs: m.ips}, "", "  ")
 	if err == nil {
 		m.dirty = false
 	}

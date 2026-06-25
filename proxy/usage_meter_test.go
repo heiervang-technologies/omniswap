@@ -13,11 +13,11 @@ func TestUsageMeter_RecordAggregatePersist(t *testing.T) {
 	path := filepath.Join(dir, "usage.json")
 
 	m := NewUsageMeter(path, nil)
-	m.Record("shay", "gemma-4-12b", "NO", 100, 50)
-	m.Record("shay", "gemma-4-12b", "NO", 10, 5)
-	m.Record("shay", "qwen3.6-35b-a3b", "NO", 7, 3)
-	m.Record("markus", "gemma-4-12b", "US", 1000, 2000)
-	m.Record("", "gemma-4-12b", "", 1, 1) // empty -> client "unknown", country "local"
+	m.Record("shay", "gemma-4-12b", "NO", "1.2.3.4", 100, 50)
+	m.Record("shay", "gemma-4-12b", "NO", "1.2.3.4", 10, 5)
+	m.Record("shay", "qwen3.6-35b-a3b", "NO", "1.2.3.4", 7, 3)
+	m.Record("markus", "gemma-4-12b", "US", "8.8.8.8", 1000, 2000)
+	m.Record("", "gemma-4-12b", "", "", 1, 1) // empty -> client "unknown", country "local", ip "unknown"
 
 	snap := m.Snapshot()
 	clients := snap["clients"].(map[string]*clientUsage)
@@ -27,6 +27,13 @@ func TestUsageMeter_RecordAggregatePersist(t *testing.T) {
 	assert.EqualValues(t, 3, byCountry["NO"].Requests, "shay's 3 from NO")
 	assert.EqualValues(t, 1, byCountry["US"].Requests, "markus from US")
 	require.Contains(t, byCountry, "local", "empty country buckets as local")
+
+	// by-ip rollup
+	byIP := snap["by_ip"].(map[string]*ipUsage)
+	assert.EqualValues(t, 3, byIP["1.2.3.4"].Requests, "shay's 3 from one IP")
+	assert.Equal(t, "shay", byIP["1.2.3.4"].Client)
+	assert.Equal(t, "NO", byIP["1.2.3.4"].Country)
+	require.Contains(t, byIP, "unknown", "empty ip buckets as unknown")
 
 	// per-client totals
 	require.Contains(t, clients, "shay")
