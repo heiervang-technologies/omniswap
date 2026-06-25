@@ -41,6 +41,7 @@ type ProxyManager struct {
 
 	metricsMonitor *metricsMonitor
 	usageMeter     *UsageMeter
+	rateLimiter    *rateLimiter
 
 	processGroups map[string]*ProcessGroup
 
@@ -154,6 +155,7 @@ func New(proxyConfig config.Config) *ProxyManager {
 
 		metricsMonitor: newMetricsMonitor(proxyLogger, maxMetrics),
 		usageMeter:     NewUsageMeter(proxyConfig.UsagePath, proxyLogger),
+		rateLimiter:    newRateLimiter(proxyConfig.RateLimitPerMin, proxyConfig.RateLimitOverrides),
 
 		processGroups: make(map[string]*ProcessGroup),
 
@@ -316,8 +318,9 @@ func (pm *ProxyManager) setupGinEngine() {
 
 	pm.ginEngine.GET("/v1/models", pm.apiKeyAuth(), pm.listModelsHandler)
 
-	// per-client token usage analytics (auth-gated)
+	// per-client token usage analytics (admin-only)
 	pm.ginEngine.GET("/usage", pm.apiKeyAuth(), pm.usageHandler)
+	pm.ginEngine.POST("/usage/reset", pm.apiKeyAuth(), pm.usageResetHandler)
 
 	// in proxymanager_loghandlers.go
 	pm.ginEngine.GET("/logs", pm.apiKeyAuth(), pm.sendLogsHandlers)
@@ -1120,6 +1123,16 @@ func (pm *ProxyManager) apiKeyAuth() gin.HandlerFunc {
 			ip = c.ClientIP()
 		}
 		c.Set("ip", ip)
+
+		// Per-client rate limit on inference (POST). DISABLED by default — the
+		// limiter is only consulted when an operator configures a limit, so this
+		// is a no-op until then and can't 429 legit traffic.
+		if c.Request.Method == http.MethodPost && pm.rateLimiter.enabled() && !pm.rateLimiter.allow(label) {
+			c.Header("Retry-After", "60")
+			pm.sendErrorResponse(c, http.StatusTooManyRequests, "rate limit exceeded for this key")
+			c.Abort()
+			return
+		}
 
 		// Strip auth headers to prevent leakage to upstream
 		c.Request.Header.Del("Authorization")

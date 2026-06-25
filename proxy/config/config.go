@@ -163,6 +163,13 @@ type Config struct {
 	// label "admin" may read it. Any other valid key gets 403.
 	UsageReaders []string `yaml:"usageReaders"`
 
+	// RateLimitPerMin caps inference (POST) requests per client per minute. 0 (the
+	// default) DISABLES rate limiting entirely — the limiter is a no-op, so it can
+	// never 429 legit traffic until an operator opts in. Per-label overrides:
+	// RateLimitOverrides[label] wins over the default.
+	RateLimitPerMin    int            `yaml:"rateLimitPerMin"`
+	RateLimitOverrides map[string]int `yaml:"rateLimitOverrides"`
+
 	// support remote peers, see issue #433, #296
 	Peers PeerDictionaryConfig `yaml:"peers"`
 }

@@ -13,24 +13,26 @@ import (
 	"github.com/gin-gonic/gin"
 )
 
-// usageHandler serves the per-client/per-country usage rollup as JSON. It is
-// ADMIN-ONLY: usage exposes who-used-what, so only keys whose label is in
-// config.UsageReaders (default just "admin") may read it; any other valid key
-// gets 403. apiKeyAuth has already set the caller's label in the gin context.
-func (pm *ProxyManager) usageHandler(c *gin.Context) {
+// usageReaderAllowed reports whether the caller's label may access the usage
+// analytics (admin-only). config.UsageReaders, default just "admin". apiKeyAuth
+// has already set the caller's label in the gin context.
+func (pm *ProxyManager) usageReaderAllowed(c *gin.Context) bool {
 	readers := pm.config.UsageReaders
 	if len(readers) == 0 {
 		readers = []string{"admin"}
 	}
 	caller := c.GetString("client")
-	allowed := false
 	for _, r := range readers {
 		if caller == r {
-			allowed = true
-			break
+			return true
 		}
 	}
-	if !allowed {
+	return false
+}
+
+// usageHandler serves the per-client/country/IP usage rollup as JSON (admin-only).
+func (pm *ProxyManager) usageHandler(c *gin.Context) {
+	if !pm.usageReaderAllowed(c) {
 		pm.sendErrorResponse(c, http.StatusForbidden, "forbidden: /usage is admin-only")
 		return
 	}
@@ -39,6 +41,19 @@ func (pm *ProxyManager) usageHandler(c *gin.Context) {
 		return
 	}
 	c.JSON(http.StatusOK, pm.usageMeter.Snapshot())
+}
+
+// usageResetHandler clears the usage rollup (admin-only). The clean replacement
+// for the alpine-pod hostPath wipe.
+func (pm *ProxyManager) usageResetHandler(c *gin.Context) {
+	if !pm.usageReaderAllowed(c) {
+		pm.sendErrorResponse(c, http.StatusForbidden, "forbidden: /usage is admin-only")
+		return
+	}
+	if pm.usageMeter != nil {
+		pm.usageMeter.Reset()
+	}
+	c.JSON(http.StatusOK, gin.H{"reset": true})
 }
 
 // clientFromContext reads the usage-attribution label that apiKeyAuth +
@@ -280,6 +295,18 @@ func (m *UsageMeter) Snapshot() map[string]any {
 			"total_tokens":  totIn + totOut,
 		},
 	}
+}
+
+// Reset clears all usage rollups (admin op) and flushes the now-empty state to
+// disk so the reset survives a restart.
+func (m *UsageMeter) Reset() {
+	m.mu.Lock()
+	m.clients = map[string]*clientUsage{}
+	m.countries = map[string]*modelUsage{}
+	m.ips = map[string]*ipUsage{}
+	m.dirty = true
+	m.mu.Unlock()
+	m.flush()
 }
 
 func (m *UsageMeter) persistLoop(every time.Duration) {
