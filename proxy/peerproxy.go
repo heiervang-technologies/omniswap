@@ -9,6 +9,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/mostlygeek/llama-swap/proxy/config"
@@ -18,11 +19,19 @@ type peerProxyMember struct {
 	peerID       string
 	reverseProxy *httputil.ReverseProxy
 	apiKey       string
+	// inFlight is the number of requests currently being proxied to this peer.
+	// Used by pickPeerForModel to spread concurrent load across peers that serve
+	// the same model. Touched only via sync/atomic.
+	inFlight int64
 }
 
 type PeerProxy struct {
-	peers    config.PeerDictionaryConfig
-	proxyMap map[string]*peerProxyMember
+	peers config.PeerDictionaryConfig
+	// modelPeers maps a model id to EVERY peer that serves it (a slice, not a
+	// single winner). When more than one peer serves a model, ProxyRequest ranks
+	// them warm > vacant > busy so traffic prefers an already-loaded copy and
+	// spills to idle GPUs under load instead of serializing on one node.
+	modelPeers map[string][]*peerProxyMember
 
 	// memberByPeer indexes proxy members by peer id for node-pinned (`@node`)
 	// dispatch, which bypasses the model->peer map.
@@ -42,7 +51,7 @@ type PeerProxy struct {
 }
 
 func NewPeerProxy(peers config.PeerDictionaryConfig, proxyLogger *LogMonitor) (*PeerProxy, error) {
-	proxyMap := make(map[string]*peerProxyMember)
+	modelPeers := make(map[string][]*peerProxyMember)
 	memberByPeer := make(map[string]*peerProxyMember)
 
 	// Sort peer IDs for consistent iteration order
@@ -104,19 +113,30 @@ func NewPeerProxy(peers config.PeerDictionaryConfig, proxyLogger *LogMonitor) (*
 		}
 		memberByPeer[peerID] = pp
 
-		// Map each model to this peer's proxy
+		// Register this peer for every model it serves. Unlike the old
+		// first-peer-wins map, ALL peers that list a model are kept so
+		// ProxyRequest can pick the best one (warm/idle/least-loaded) at
+		// dispatch time.
 		for _, modelID := range peer.Models {
-			if _, found := proxyMap[modelID]; found {
-				proxyLogger.Warnf("peer %s: model %s already mapped to another peer, skipping", peerID, modelID)
-				continue
+			modelPeers[modelID] = append(modelPeers[modelID], pp)
+		}
+	}
+
+	// Surface which models are multi-peer (load-aware routing applies to these).
+	for modelID, members := range modelPeers {
+		if len(members) > 1 {
+			ids := make([]string, 0, len(members))
+			for _, m := range members {
+				ids = append(ids, m.peerID)
 			}
-			proxyMap[modelID] = pp
+			sort.Strings(ids)
+			proxyLogger.Infof("peer routing: model %q served by %d peers %v (load-aware: warm>vacant>busy)", modelID, len(members), ids)
 		}
 	}
 
 	return &PeerProxy{
 		peers:        peers,
-		proxyMap:     proxyMap,
+		modelPeers:   modelPeers,
 		memberByPeer: memberByPeer,
 		peerOrder:    peerIDs,
 		logger:       proxyLogger,
@@ -129,18 +149,19 @@ func NewPeerProxy(peers config.PeerDictionaryConfig, proxyLogger *LogMonitor) (*
 }
 
 func (p *PeerProxy) HasPeerModel(modelID string) bool {
-	_, found := p.proxyMap[modelID]
-	return found
+	return len(p.modelPeers[modelID]) > 0
 }
 
 // GetPeerFilters returns the filters for a peer model, or empty filters if not found
 func (p *PeerProxy) GetPeerFilters(modelID string) config.Filters {
-	pp, found := p.proxyMap[modelID]
-	if !found {
+	members := p.modelPeers[modelID]
+	if len(members) == 0 {
 		return config.Filters{}
 	}
-	// Get the peer config using the peerID
-	peer, found := p.peers[pp.peerID]
+	// Filters are configured per-peer; for a model served by several peers we
+	// apply the first peer's (peers serving the same model are expected to share
+	// filter config). The pinned `@node` path uses that node's own PeerFilters().
+	peer, found := p.peers[members[0].peerID]
 	if !found {
 		return config.Filters{}
 	}
@@ -151,9 +172,14 @@ func (p *PeerProxy) ListPeers() config.PeerDictionaryConfig {
 	return p.peers
 }
 
+// ProxyRequest dispatches a by-name (non-pinned) request to the best peer that
+// serves the model. When several peers serve it, pickPeerForModel ranks them
+// warm > vacant > busy, so we prefer an already-loaded copy and spill to idle
+// GPUs under load. The peer's in-flight count is tracked around the dispatch so
+// concurrent requests fan out instead of serializing on one node.
 func (p *PeerProxy) ProxyRequest(model_id string, writer http.ResponseWriter, request *http.Request) error {
-	pp, found := p.proxyMap[model_id]
-	if !found {
+	pp := p.pickPeerForModel(model_id)
+	if pp == nil {
 		return fmt.Errorf("no peer proxy found for model %s", model_id)
 	}
 
@@ -163,8 +189,52 @@ func (p *PeerProxy) ProxyRequest(model_id string, writer http.ResponseWriter, re
 		request.Header.Set("x-api-key", pp.apiKey)
 	}
 
+	atomic.AddInt64(&pp.inFlight, 1)
+	defer atomic.AddInt64(&pp.inFlight, -1)
 	pp.reverseProxy.ServeHTTP(writer, request)
 	return nil
+}
+
+// pickPeerForModel selects which peer serves modelID among all peers that list
+// it. One candidate -> return it. Several -> rank by
+//
+//	rank = inFlight*2 + bias,  bias{warm:0, vacant:1, occupied-by-other:3}
+//
+// (lower wins; ties broken by the deterministic peerOrder, since candidates are
+// appended in sorted-peerID order and we keep the first on a tie). So a warm
+// idle peer always wins; a warm-but-busy peer yields to a vacant GPU (a one-time
+// cold-load, after which it too is warm); a peer running a different model is
+// evicted only when nothing better exists. Warm/loaded state is read from the
+// same short-TTL loadedCache the `@node`/`any` resolver uses (no extra polling).
+func (p *PeerProxy) pickPeerForModel(modelID string) *peerProxyMember {
+	candidates := p.modelPeers[modelID]
+	switch len(candidates) {
+	case 0:
+		return nil
+	case 1:
+		return candidates[0]
+	}
+
+	var best *peerProxyMember
+	var bestKey int64
+	for _, pp := range candidates {
+		peer := p.peers[pp.peerID]
+		loaded := p.peerLoaded(pp.peerID, peer)
+		var bias int64
+		switch {
+		case loaded.all[modelID]: // model resident here -> warm, no cold load
+			bias = 0
+		case len(loaded.order) == 0: // nothing loaded -> cold-load onto a free GPU
+			bias = 1
+		default: // a different model is resident -> cold-load needs an evict
+			bias = 3
+		}
+		key := atomic.LoadInt64(&pp.inFlight)*2 + bias
+		if best == nil || key < bestKey {
+			best, bestKey = pp, key
+		}
+	}
+	return best
 }
 
 // ProxyRequestToPeer dispatches directly to a named peer, bypassing the
@@ -181,6 +251,10 @@ func (p *PeerProxy) ProxyRequestToPeer(peerID, modelID string, writer http.Respo
 		request.Header.Set("x-api-key", pp.apiKey)
 	}
 
+	// Count pinned (`@node`) traffic too, so the load-aware picker sees a node's
+	// real occupancy when ranking by-name requests for the same model.
+	atomic.AddInt64(&pp.inFlight, 1)
+	defer atomic.AddInt64(&pp.inFlight, -1)
 	pp.reverseProxy.ServeHTTP(writer, request)
 	return nil
 }
