@@ -22,6 +22,7 @@ type TokenMetrics struct {
 	ID              int       `json:"id"`
 	Timestamp       time.Time `json:"timestamp"`
 	Model           string    `json:"model"`
+	Client          string    `json:"client"` // usage-attribution label (set from the auth'd key)
 	CachedTokens    int       `json:"cache_tokens"`
 	InputTokens     int       `json:"input_tokens"`
 	OutputTokens    int       `json:"output_tokens"`
@@ -46,6 +47,9 @@ type metricsMonitor struct {
 	maxMetrics int
 	nextID     int
 	logger     *LogMonitor
+	// onRecord, if set, is invoked for every recorded metric (used to feed the
+	// per-client usage meter). Must be cheap / non-blocking.
+	onRecord func(TokenMetrics)
 }
 
 func newMetricsMonitor(logger *LogMonitor, maxMetrics int) *metricsMonitor {
@@ -67,6 +71,9 @@ func (mp *metricsMonitor) addMetrics(metric TokenMetrics) {
 	mp.metrics = append(mp.metrics, metric)
 	if len(mp.metrics) > mp.maxMetrics {
 		mp.metrics = mp.metrics[len(mp.metrics)-mp.maxMetrics:]
+	}
+	if mp.onRecord != nil {
+		mp.onRecord(metric)
 	}
 	event.Emit(TokenMetricsEvent{Metrics: metric})
 }
@@ -120,6 +127,7 @@ func (mp *metricsMonitor) wrapHandler(
 	tm := TokenMetrics{
 		Timestamp:  time.Now(),
 		Model:      modelID,
+		Client:     clientFromContext(request),
 		DurationMs: int(time.Since(recorder.StartTime()).Milliseconds()),
 	}
 
@@ -165,6 +173,8 @@ func (mp *metricsMonitor) wrapHandler(
 		}
 	}
 
+	// tm is reassigned by the streaming/JSON parse above, so re-stamp the client.
+	tm.Client = clientFromContext(request)
 	mp.addMetrics(tm)
 	return nil
 }
