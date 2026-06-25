@@ -27,7 +27,7 @@ func newTestPeerProxy() *PeerProxy {
 	}
 	p := &PeerProxy{
 		peers:        peers,
-		proxyMap:     map[string]*peerProxyMember{},
+		modelPeers:   map[string][]*peerProxyMember{},
 		memberByPeer: map[string]*peerProxyMember{},
 		peerOrder:    []string{"crystal", "lithium", "titan"},
 		loadedCache:  map[string]peerLoadedSet{},
