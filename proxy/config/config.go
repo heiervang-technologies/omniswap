@@ -158,6 +158,11 @@ type Config struct {
 	// restarts). Empty = in-memory only.
 	UsagePath string `yaml:"usagePath"`
 
+	// UsageReaders lists the client LABELS allowed to read GET /usage (the usage
+	// analytics expose who-used-what, so they're admin-only). Empty -> only the
+	// label "admin" may read it. Any other valid key gets 403.
+	UsageReaders []string `yaml:"usageReaders"`
+
 	// support remote peers, see issue #433, #296
 	Peers PeerDictionaryConfig `yaml:"peers"`
 }

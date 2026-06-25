@@ -13,14 +13,20 @@ func TestUsageMeter_RecordAggregatePersist(t *testing.T) {
 	path := filepath.Join(dir, "usage.json")
 
 	m := NewUsageMeter(path, nil)
-	m.Record("shay", "gemma-4-12b", 100, 50)
-	m.Record("shay", "gemma-4-12b", 10, 5)
-	m.Record("shay", "qwen3.6-35b-a3b", 7, 3)
-	m.Record("markus", "gemma-4-12b", 1000, 2000)
-	m.Record("", "gemma-4-12b", 1, 1) // empty -> "unknown"
+	m.Record("shay", "gemma-4-12b", "NO", 100, 50)
+	m.Record("shay", "gemma-4-12b", "NO", 10, 5)
+	m.Record("shay", "qwen3.6-35b-a3b", "NO", 7, 3)
+	m.Record("markus", "gemma-4-12b", "US", 1000, 2000)
+	m.Record("", "gemma-4-12b", "", 1, 1) // empty -> client "unknown", country "local"
 
 	snap := m.Snapshot()
 	clients := snap["clients"].(map[string]*clientUsage)
+
+	// by-country rollup
+	byCountry := snap["by_country"].(map[string]*modelUsage)
+	assert.EqualValues(t, 3, byCountry["NO"].Requests, "shay's 3 from NO")
+	assert.EqualValues(t, 1, byCountry["US"].Requests, "markus from US")
+	require.Contains(t, byCountry, "local", "empty country buckets as local")
 
 	// per-client totals
 	require.Contains(t, clients, "shay")

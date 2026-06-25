@@ -13,8 +13,27 @@ import (
 	"github.com/gin-gonic/gin"
 )
 
-// usageHandler serves the per-client token-usage rollup as JSON (auth-gated).
+// usageHandler serves the per-client/per-country usage rollup as JSON. It is
+// ADMIN-ONLY: usage exposes who-used-what, so only keys whose label is in
+// config.UsageReaders (default just "admin") may read it; any other valid key
+// gets 403. apiKeyAuth has already set the caller's label in the gin context.
 func (pm *ProxyManager) usageHandler(c *gin.Context) {
+	readers := pm.config.UsageReaders
+	if len(readers) == 0 {
+		readers = []string{"admin"}
+	}
+	caller := c.GetString("client")
+	allowed := false
+	for _, r := range readers {
+		if caller == r {
+			allowed = true
+			break
+		}
+	}
+	if !allowed {
+		pm.sendErrorResponse(c, http.StatusForbidden, "forbidden: /usage is admin-only")
+		return
+	}
 	if pm.usageMeter == nil {
 		c.JSON(http.StatusOK, gin.H{"clients": gin.H{}, "order": []string{}, "totals": gin.H{}})
 		return
@@ -26,10 +45,20 @@ func (pm *ProxyManager) usageHandler(c *gin.Context) {
 // proxyInferenceHandler stash in the request context. Empty when unauth'd or
 // not an inference path.
 func clientFromContext(r *http.Request) string {
+	return ctxStr(r, "client")
+}
+
+// countryFromContext reads the request's Cf-IPCountry (set by apiKeyAuth +
+// proxyInferenceHandler). Empty for LAN / non-Cloudflare requests.
+func countryFromContext(r *http.Request) string {
+	return ctxStr(r, "country")
+}
+
+func ctxStr(r *http.Request, key string) string {
 	if r == nil {
 		return ""
 	}
-	if v, ok := r.Context().Value(proxyCtxKey("client")).(string); ok {
+	if v, ok := r.Context().Value(proxyCtxKey(key)).(string); ok {
 		return v
 	}
 	return ""
@@ -70,17 +99,30 @@ type clientUsage struct {
 	LastSeen     time.Time              `json:"last_seen"`
 }
 
-// UsageMeter aggregates per-client token usage. Thread-safe; persisted to disk.
+// usagePersist is the on-disk shape (clients + country rollups).
+type usagePersist struct {
+	Clients   map[string]*clientUsage `json:"clients"`
+	Countries map[string]*modelUsage  `json:"countries"`
+}
+
+// UsageMeter aggregates per-client (and per-country) token usage. Thread-safe;
+// persisted to disk.
 type UsageMeter struct {
-	mu      sync.Mutex
-	path    string
-	clients map[string]*clientUsage
-	dirty   bool
-	logger  *LogMonitor
+	mu        sync.Mutex
+	path      string
+	clients   map[string]*clientUsage
+	countries map[string]*modelUsage // ISO country (from Cf-IPCountry) -> totals
+	dirty     bool
+	logger    *LogMonitor
 }
 
 func NewUsageMeter(path string, logger *LogMonitor) *UsageMeter {
-	m := &UsageMeter{path: path, clients: map[string]*clientUsage{}, logger: logger}
+	m := &UsageMeter{
+		path:      path,
+		clients:   map[string]*clientUsage{},
+		countries: map[string]*modelUsage{},
+		logger:    logger,
+	}
 	m.load()
 	if m.path != "" {
 		go m.persistLoop(15 * time.Second)
@@ -96,23 +138,32 @@ func (m *UsageMeter) load() {
 	if err != nil {
 		return // first run / no file yet
 	}
-	var snap map[string]*clientUsage
-	if err := json.Unmarshal(b, &snap); err == nil && snap != nil {
-		m.clients = snap
+	var snap usagePersist
+	if err := json.Unmarshal(b, &snap); err == nil {
+		if snap.Clients != nil {
+			m.clients = snap.Clients
+		}
+		if snap.Countries != nil {
+			m.countries = snap.Countries
+		}
 		if m.logger != nil {
-			m.logger.Infof("usage meter: loaded %d clients from %s", len(snap), m.path)
+			m.logger.Infof("usage meter: loaded %d clients / %d countries from %s", len(m.clients), len(m.countries), m.path)
 		}
 	}
 }
 
-// Record attributes one completed request's token usage to a client. A zero/empty
-// client is bucketed as "unknown". Negative tokens (missing usage) clamp to 0.
-func (m *UsageMeter) Record(client, model string, inTok, outTok int) {
+// Record attributes one completed request's token usage to a client and a
+// country (from Cf-IPCountry; "local" for LAN/no header). A zero/empty client is
+// bucketed as "unknown". Negative tokens (missing usage) clamp to 0.
+func (m *UsageMeter) Record(client, model, country string, inTok, outTok int) {
 	if client == "" {
 		client = "unknown"
 	}
 	if model == "" {
 		model = "unknown"
+	}
+	if country == "" {
+		country = "local"
 	}
 	if inTok < 0 {
 		inTok = 0
@@ -124,6 +175,16 @@ func (m *UsageMeter) Record(client, model string, inTok, outTok int) {
 
 	m.mu.Lock()
 	defer m.mu.Unlock()
+
+	co := m.countries[country]
+	if co == nil {
+		co = &modelUsage{}
+		m.countries[country] = co
+	}
+	co.Requests++
+	co.InputTokens += int64(inTok)
+	co.OutputTokens += int64(outTok)
+
 	cu := m.clients[client]
 	if cu == nil {
 		cu = &clientUsage{ByModel: map[string]*modelUsage{}, FirstSeen: now}
@@ -169,9 +230,10 @@ func (m *UsageMeter) Snapshot() map[string]any {
 		return order[i] < order[j]
 	})
 	return map[string]any{
-		"as_of":   time.Now().UTC().Format(time.RFC3339),
-		"order":   order,
-		"clients": m.clients,
+		"as_of":      time.Now().UTC().Format(time.RFC3339),
+		"order":      order,
+		"clients":    m.clients,
+		"by_country": m.countries,
 		"totals": map[string]int64{
 			"requests":      totReq,
 			"input_tokens":  totIn,
@@ -195,7 +257,7 @@ func (m *UsageMeter) flush() {
 		m.mu.Unlock()
 		return
 	}
-	b, err := json.MarshalIndent(m.clients, "", "  ")
+	b, err := json.MarshalIndent(usagePersist{Clients: m.clients, Countries: m.countries}, "", "  ")
 	if err == nil {
 		m.dirty = false
 	}
