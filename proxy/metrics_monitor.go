@@ -24,6 +24,7 @@ type TokenMetrics struct {
 	Model           string    `json:"model"`
 	Client          string    `json:"client"`  // usage-attribution label (set from the auth'd key)
 	Country         string    `json:"country"` // ISO country from Cf-IPCountry ("local" for LAN)
+	IP              string    `json:"ip"`      // source IP (Cf-Connecting-Ip / ClientIP)
 	CachedTokens    int       `json:"cache_tokens"`
 	InputTokens     int       `json:"input_tokens"`
 	OutputTokens    int       `json:"output_tokens"`
@@ -130,6 +131,7 @@ func (mp *metricsMonitor) wrapHandler(
 		Model:      modelID,
 		Client:     clientFromContext(request),
 		Country:    countryFromContext(request),
+		IP:         ipFromContext(request),
 		DurationMs: int(time.Since(recorder.StartTime()).Milliseconds()),
 	}
 
@@ -175,9 +177,10 @@ func (mp *metricsMonitor) wrapHandler(
 		}
 	}
 
-	// tm is reassigned by the streaming/JSON parse above, so re-stamp client+country.
+	// tm is reassigned by the streaming/JSON parse above, so re-stamp the attribution.
 	tm.Client = clientFromContext(request)
 	tm.Country = countryFromContext(request)
+	tm.IP = ipFromContext(request)
 	mp.addMetrics(tm)
 	return nil
 }

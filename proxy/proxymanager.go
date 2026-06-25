@@ -169,7 +169,7 @@ func New(proxyConfig config.Config) *ProxyManager {
 
 	// Feed every recorded token metric into the per-client usage meter.
 	pm.metricsMonitor.onRecord = func(tm TokenMetrics) {
-		pm.usageMeter.Record(tm.Client, tm.Model, tm.Country, tm.InputTokens, tm.OutputTokens)
+		pm.usageMeter.Record(tm.Client, tm.Model, tm.Country, tm.IP, tm.InputTokens, tm.OutputTokens)
 	}
 
 	// create the process groups
@@ -878,6 +878,7 @@ func (pm *ProxyManager) proxyInferenceHandler(c *gin.Context) {
 	ctx = context.WithValue(ctx, proxyCtxKey("model"), modelID)
 	ctx = context.WithValue(ctx, proxyCtxKey("client"), c.GetString("client"))   // usage attribution
 	ctx = context.WithValue(ctx, proxyCtxKey("country"), c.GetString("country")) // geo attribution
+	ctx = context.WithValue(ctx, proxyCtxKey("ip"), c.GetString("ip"))           // source IP
 	c.Request = c.Request.WithContext(ctx)
 
 	if pm.metricsMonitor != nil && c.Request.Method == "POST" && shouldCollectMetrics(c.Request.URL.Path) {
@@ -1110,9 +1111,15 @@ func (pm *ProxyManager) apiKeyAuth() gin.HandlerFunc {
 			label = fp
 		}
 		c.Set("client", label)
-		// Country comes from Cloudflare's edge (Cf-IPCountry) when the request
-		// arrives via the tunnel; empty for LAN/direct requests.
+		// Country + source IP come from Cloudflare's edge (Cf-IPCountry /
+		// Cf-Connecting-Ip) when via the tunnel; fall back to gin's ClientIP for
+		// LAN/direct requests.
 		c.Set("country", c.GetHeader("Cf-IPCountry"))
+		ip := c.GetHeader("Cf-Connecting-Ip")
+		if ip == "" {
+			ip = c.ClientIP()
+		}
+		c.Set("ip", ip)
 
 		// Strip auth headers to prevent leakage to upstream
 		c.Request.Header.Del("Authorization")
