@@ -493,6 +493,11 @@ func (pm *ProxyManager) listModelsHandler(c *gin.Context) {
 	}
 
 	if pm.peerProxy != nil {
+		// Refresh all peers' loaded-state CONCURRENTLY up front, so a dead/slow
+		// peer can't serialize this union behind a chain of per-peer dial
+		// timeouts (a down titan peer once wedged the union 35s+ → pool looked
+		// down). After this, the per-peer reads below are cache hits.
+		pm.peerProxy.WarmLoaded()
 		for peerID, peer := range pm.peerProxy.ListPeers() {
 			// add peer models
 			for _, modelID := range peer.Models {

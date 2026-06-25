@@ -345,3 +345,24 @@ func TestProxyRequest_SSEHeaderModification(t *testing.T) {
 	// The X-Accel-Buffering header should be set to "no" for SSE
 	assert.Equal(t, "no", w.Header().Get("X-Accel-Buffering"))
 }
+
+func TestWarmLoadedDeadPeerDegradesFast(t *testing.T) {
+	// A peer whose host refuses/blackholes the poll must not stall WarmLoaded;
+	// it should negative-cache (empty) and return well under the old 5s serial hang.
+	p := &PeerProxy{
+		peers: config.PeerDictionaryConfig{
+			"dead": {Proxy: "http://127.0.0.1:1", ProxyURL: mustURL("http://127.0.0.1:1")},
+		},
+		peerOrder:   []string{"dead"},
+		loadedCache: map[string]peerLoadedSet{},
+		loadedTTL:   5 * time.Second,
+		httpClient:  &http.Client{Timeout: 2 * time.Second},
+	}
+	start := time.Now()
+	p.WarmLoaded()
+	if d := time.Since(start); d > 3*time.Second {
+		t.Fatalf("WarmLoaded with a dead peer took %v, expected fast degrade", d)
+	}
+	ls := p.peerLoaded("dead", p.peers["dead"])
+	assert.Empty(t, ls.order, "dead peer should negative-cache to empty loaded set")
+}

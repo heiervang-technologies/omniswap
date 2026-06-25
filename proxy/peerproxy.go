@@ -150,9 +150,22 @@ func NewPeerProxy(peers config.PeerDictionaryConfig, proxyLogger *LogMonitor) (*
 		memberByPeer: memberByPeer,
 		peerOrder:    peerIDs,
 		logger:       proxyLogger,
-		// Short-timeout client used only for polling peers' /v1/models to
-		// resolve the `any` wildcard; never used for streaming inference.
-		httpClient:  &http.Client{Timeout: 5 * time.Second},
+		// Short-timeout client used only for polling peers' /v1/models (loaded
+		// state + the `any` wildcard); never used for streaming inference. The
+		// 1.5s DIAL timeout is the load-bearing bit: a dead peer whose host is
+		// down blackholes the SYN, so without a dial cap the poll hangs on the OS
+		// default and serializes the /v1/models union behind it (a down titan peer
+		// wedged the home union 35s+). 1.5s dial fails fast; WarmLoaded fans the
+		// polls out concurrently so one dead peer adds ~1.5s, not 1.5s-per-peer.
+		httpClient: &http.Client{
+			Timeout: 2 * time.Second,
+			Transport: &http.Transport{
+				DialContext:         (&net.Dialer{Timeout: 1500 * time.Millisecond}).DialContext,
+				TLSHandshakeTimeout: 1500 * time.Millisecond,
+				MaxIdleConns:        20,
+				IdleConnTimeout:     30 * time.Second,
+			},
+		},
 		loadedCache: make(map[string]peerLoadedSet),
 		loadedTTL:   5 * time.Second,
 	}, nil
@@ -176,6 +189,26 @@ func (p *PeerProxy) GetPeerFilters(modelID string) config.Filters {
 		return config.Filters{}
 	}
 	return peer.Filters
+}
+
+// WarmLoaded refreshes the loaded-state cache for ALL peers CONCURRENTLY. The
+// /v1/models union calls peerLoaded once per peer as it folds them in; doing
+// that sequentially means a single dead/slow peer serializes the whole union
+// behind its dial timeout. Calling WarmLoaded first fans the polls out in
+// parallel (each bounded by the short httpClient dial timeout) and populates the
+// cache, so the subsequent per-peer reads are cache hits and a down peer adds
+// ~one dial-timeout to the union total instead of one-per-peer. A failed poll
+// negative-caches (empty), so the peer is simply listed as not-loaded.
+func (p *PeerProxy) WarmLoaded() {
+	var wg sync.WaitGroup
+	for _, peerID := range p.peerOrder {
+		wg.Add(1)
+		go func(id string) {
+			defer wg.Done()
+			p.peerLoaded(id, p.peers[id])
+		}(peerID)
+	}
+	wg.Wait()
 }
 
 func (p *PeerProxy) ListPeers() config.PeerDictionaryConfig {
