@@ -22,7 +22,8 @@ type TokenMetrics struct {
 	ID              int       `json:"id"`
 	Timestamp       time.Time `json:"timestamp"`
 	Model           string    `json:"model"`
-	Client          string    `json:"client"` // usage-attribution label (set from the auth'd key)
+	Client          string    `json:"client"`  // usage-attribution label (set from the auth'd key)
+	Country         string    `json:"country"` // ISO country from Cf-IPCountry ("local" for LAN)
 	CachedTokens    int       `json:"cache_tokens"`
 	InputTokens     int       `json:"input_tokens"`
 	OutputTokens    int       `json:"output_tokens"`
@@ -128,6 +129,7 @@ func (mp *metricsMonitor) wrapHandler(
 		Timestamp:  time.Now(),
 		Model:      modelID,
 		Client:     clientFromContext(request),
+		Country:    countryFromContext(request),
 		DurationMs: int(time.Since(recorder.StartTime()).Milliseconds()),
 	}
 
@@ -173,8 +175,9 @@ func (mp *metricsMonitor) wrapHandler(
 		}
 	}
 
-	// tm is reassigned by the streaming/JSON parse above, so re-stamp the client.
+	// tm is reassigned by the streaming/JSON parse above, so re-stamp client+country.
 	tm.Client = clientFromContext(request)
+	tm.Country = countryFromContext(request)
 	mp.addMetrics(tm)
 	return nil
 }
