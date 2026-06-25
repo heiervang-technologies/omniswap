@@ -1,7 +1,7 @@
 # llm-pool.Dockerfile — thin omniswap router image for the cluster "monolith".
 #
 # Builds the omniswap binary from source (no GGUFs, no llama.cpp, no GPU) and
-# ships it on debian-slim. This is the image k8s deploys as default/llm-pool;
+# ships it on distroless-static. This is the image k8s deploys as default/llm-pool;
 # it supersedes the old stock-mostlygeek/llama-swap binary so the cluster gets
 # the <model>@<node> addressing grammar and the dynamic `any` resolver.
 #
@@ -23,10 +23,14 @@ RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build \
     -ldflags="-X main.commit=${GIT_HASH} -X main.version=llmpool_${GIT_HASH} -X main.date=${BUILD_DATE}" \
     -o /omniswap
 
-FROM debian:bookworm-slim
-RUN apt-get update && \
-    apt-get install -y --no-install-recommends ca-certificates curl && \
-    rm -rf /var/lib/apt/lists/*
+# Runtime: distroless static. The binary is CGO_ENABLED=0 (fully static), the
+# pool runs peer-mode only (no child llama-server, so no shell needed), and both
+# deployments use httpGet probes (no exec/curl), so debian + curl bought nothing.
+# distroless/static is ~2MB (vs debian-slim ~74MB + apt layers) → ~70MB smaller
+# image, which matters: this is pushed to the gem zot over the flaky WiFi diode,
+# where fewer/smaller blobs = faster, more reliable skopeo copies. ca-certificates
+# are bundled in distroless/static (parity for any HTTPS peer). Runs as nonroot.
+FROM gcr.io/distroless/static-debian12:nonroot
 # Keep the binary named llama-swap so the existing Deployment CMD is unchanged.
 COPY --from=builder /omniswap /usr/local/bin/llama-swap
 EXPOSE 8080
