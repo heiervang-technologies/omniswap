@@ -270,6 +270,14 @@ func (p *PeerProxy) pickPeerForModel(modelID string) *peerProxyMember {
 	for i, pp := range candidates {
 		loaded := p.peerLoaded(pp.peerID, p.peers[pp.peerID])
 		switch {
+		case len(loaded.served) == 0 || time.Since(loaded.fetchedAt) > 2*p.loadedTTL:
+			// Peer is unreachable: its /v1/models poll is failing (empty served,
+			// or the snapshot is stale because peerLoaded keeps returning the
+			// last-good one past TTL on repeated fetch errors). Deprioritize hard
+			// so load-aware routing doesn't dispatch inference to a dead peer and
+			// 502 it — a peer that died while warm otherwise keeps bias 0 and
+			// attracts all its traffic. Only picked if EVERY candidate is dead.
+			bias[i] = 6
 		case loaded.all[modelID]: // model resident here -> warm, no cold load
 			bias[i] = 0
 		case len(loaded.order) == 0: // nothing loaded -> cold-load onto a free GPU
