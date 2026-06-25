@@ -68,8 +68,13 @@ func NewPeerProxy(peers config.PeerDictionaryConfig, proxyLogger *LogMonitor) (*
 			Timeout:   30 * time.Second, // Connection timeout
 			KeepAlive: 30 * time.Second,
 		}).DialContext,
-		TLSHandshakeTimeout:   10 * time.Second,
-		ResponseHeaderTimeout: 60 * time.Second, // Time to wait for response headers
+		TLSHandshakeTimeout: 10 * time.Second,
+		// Time to wait for the peer's response headers (i.e. first byte). With
+		// load-aware routing a by-name request can be dispatched to a vacant peer
+		// that must COLD-LOAD the model first; on a Pascal gem that takes ~60-90s,
+		// so a 60s ceiling 502'd every spilled request mid-load. 180s tolerates a
+		// cold start while still failing a genuinely hung peer.
+		ResponseHeaderTimeout: 180 * time.Second,
 		ExpectContinueTimeout: 1 * time.Second,
 		MaxIdleConns:          100,
 		MaxIdleConnsPerHost:   10,
