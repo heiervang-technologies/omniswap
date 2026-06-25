@@ -97,9 +97,12 @@ func TestNewPeerProxy_SharedModelMultiPeer(t *testing.T) {
 
 func TestPickPeerForModel(t *testing.T) {
 	now := time.Now()
-	warm := peerLoadedSet{all: map[string]bool{"m": true}, order: []string{"m"}, fetchedAt: now}
-	vacant := peerLoadedSet{all: map[string]bool{}, order: nil, fetchedAt: now}
-	other := peerLoadedSet{all: map[string]bool{"x": true}, order: []string{"x"}, fetchedAt: now}
+	// served is populated for any reachable peer (it advertises the model in its
+	// /v1/models, loaded or not); an unreachable peer's poll fails -> empty served.
+	warm := peerLoadedSet{all: map[string]bool{"m": true}, order: []string{"m"}, served: map[string]bool{"m": true}, fetchedAt: now}
+	vacant := peerLoadedSet{all: map[string]bool{}, order: nil, served: map[string]bool{"m": true}, fetchedAt: now}
+	other := peerLoadedSet{all: map[string]bool{"x": true}, order: []string{"x"}, served: map[string]bool{"m": true, "x": true}, fetchedAt: now}
+	unreachable := peerLoadedSet{served: map[string]bool{}, fetchedAt: now} // poll failed -> nothing served
 
 	// candidates a,b,c (sorted-peerID order, as NewPeerProxy builds them)
 	newP := func() (*PeerProxy, map[string]*peerProxyMember) {
@@ -165,6 +168,26 @@ func TestPickPeerForModel(t *testing.T) {
 			got = append(got, p.pickPeerForModel("m").peerID)
 		}
 		assert.Equal(t, []string{"a", "b", "c", "a", "b", "c"}, got)
+	})
+
+	t.Run("unreachable peer is deprioritized below a reachable one", func(t *testing.T) {
+		// a dead peer (failed poll -> empty served) must not be picked over a
+		// reachable vacant peer, even though both look "not loaded".
+		p, m := newP()
+		p.loadedCache["a"], p.loadedCache["b"], p.loadedCache["c"] = unreachable, vacant, unreachable
+		assert.Equal(t, m["b"], p.pickPeerForModel("m"))
+	})
+
+	t.Run("unreachable still beaten by a warm peer", func(t *testing.T) {
+		p, m := newP()
+		p.loadedCache["a"], p.loadedCache["b"], p.loadedCache["c"] = unreachable, unreachable, warm
+		assert.Equal(t, m["c"], p.pickPeerForModel("m"))
+	})
+
+	t.Run("all unreachable still returns one (graceful upstream 502)", func(t *testing.T) {
+		p, _ := newP()
+		p.loadedCache["a"], p.loadedCache["b"], p.loadedCache["c"] = unreachable, unreachable, unreachable
+		assert.NotNil(t, p.pickPeerForModel("m"))
 	})
 }
 
