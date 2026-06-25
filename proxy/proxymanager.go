@@ -40,6 +40,7 @@ type ProxyManager struct {
 	muxLogger      *LogMonitor
 
 	metricsMonitor *metricsMonitor
+	usageMeter     *UsageMeter
 
 	processGroups map[string]*ProcessGroup
 
@@ -152,6 +153,7 @@ func New(proxyConfig config.Config) *ProxyManager {
 		upstreamLogger: upstreamLogger,
 
 		metricsMonitor: newMetricsMonitor(proxyLogger, maxMetrics),
+		usageMeter:     NewUsageMeter(proxyConfig.UsagePath, proxyLogger),
 
 		processGroups: make(map[string]*ProcessGroup),
 
@@ -163,6 +165,11 @@ func New(proxyConfig config.Config) *ProxyManager {
 		version:   "0",
 
 		peerProxy: peerProxy,
+	}
+
+	// Feed every recorded token metric into the per-client usage meter.
+	pm.metricsMonitor.onRecord = func(tm TokenMetrics) {
+		pm.usageMeter.Record(tm.Client, tm.Model, tm.InputTokens, tm.OutputTokens)
 	}
 
 	// create the process groups
@@ -308,6 +315,9 @@ func (pm *ProxyManager) setupGinEngine() {
 	pm.ginEngine.POST("/v1/images/edits", pm.apiKeyAuth(), pm.proxyOAIPostFormHandler)
 
 	pm.ginEngine.GET("/v1/models", pm.apiKeyAuth(), pm.listModelsHandler)
+
+	// per-client token usage analytics (auth-gated)
+	pm.ginEngine.GET("/usage", pm.apiKeyAuth(), pm.usageHandler)
 
 	// in proxymanager_loghandlers.go
 	pm.ginEngine.GET("/logs", pm.apiKeyAuth(), pm.sendLogsHandlers)
@@ -866,6 +876,7 @@ func (pm *ProxyManager) proxyInferenceHandler(c *gin.Context) {
 	isStreaming := gjson.GetBytes(bodyBytes, "stream").Bool()
 	ctx := context.WithValue(c.Request.Context(), proxyCtxKey("streaming"), isStreaming)
 	ctx = context.WithValue(ctx, proxyCtxKey("model"), modelID)
+	ctx = context.WithValue(ctx, proxyCtxKey("client"), c.GetString("client")) // usage attribution
 	c.Request = c.Request.WithContext(ctx)
 
 	if pm.metricsMonitor != nil && c.Request.Method == "POST" && shouldCollectMetrics(c.Request.URL.Path) {
@@ -1088,6 +1099,16 @@ func (pm *ProxyManager) apiKeyAuth() gin.HandlerFunc {
 			c.Abort()
 			return
 		}
+
+		// Attribute this request to a client LABEL for usage analytics — by key
+		// fingerprint (sha256 prefix), never the raw key. Unlabelled keys bucket
+		// under their fingerprint so they're still distinguished.
+		fp := keyFingerprint(providedKey)
+		label := pm.config.APIKeyLabels[fp]
+		if label == "" {
+			label = fp
+		}
+		c.Set("client", label)
 
 		// Strip auth headers to prevent leakage to upstream
 		c.Request.Header.Del("Authorization")

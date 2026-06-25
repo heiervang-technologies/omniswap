@@ -148,6 +148,16 @@ type Config struct {
 	// support API keys, see issue #433, #50, #251
 	RequiredAPIKeys []string `yaml:"apiKeys"`
 
+	// APIKeyLabels maps a key FINGERPRINT (sha256 prefix, not the raw key) to a
+	// human label, so per-client usage analytics can attribute tokens to e.g.
+	// "shay"/"markus" without storing the secret. Optional; unlabelled keys are
+	// bucketed under their fingerprint.
+	APIKeyLabels map[string]string `yaml:"apiKeyLabels"`
+
+	// UsagePath is where the per-client usage rollup is persisted (so it survives
+	// restarts). Empty = in-memory only.
+	UsagePath string `yaml:"usagePath"`
+
 	// support remote peers, see issue #433, #296
 	Peers PeerDictionaryConfig `yaml:"peers"`
 }
