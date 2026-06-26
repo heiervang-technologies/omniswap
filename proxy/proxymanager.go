@@ -40,6 +40,8 @@ type ProxyManager struct {
 	muxLogger      *LogMonitor
 
 	metricsMonitor *metricsMonitor
+	usageMeter     *UsageMeter
+	rateLimiter    *rateLimiter
 
 	processGroups map[string]*ProcessGroup
 
@@ -152,6 +154,8 @@ func New(proxyConfig config.Config) *ProxyManager {
 		upstreamLogger: upstreamLogger,
 
 		metricsMonitor: newMetricsMonitor(proxyLogger, maxMetrics),
+		usageMeter:     NewUsageMeter(proxyConfig.UsagePath, proxyLogger),
+		rateLimiter:    newRateLimiter(proxyConfig.RateLimitPerMin, proxyConfig.RateLimitOverrides),
 
 		processGroups: make(map[string]*ProcessGroup),
 
@@ -163,6 +167,11 @@ func New(proxyConfig config.Config) *ProxyManager {
 		version:   "0",
 
 		peerProxy: peerProxy,
+	}
+
+	// Feed every recorded token metric into the per-client usage meter.
+	pm.metricsMonitor.onRecord = func(tm TokenMetrics) {
+		pm.usageMeter.Record(tm.Client, tm.Model, tm.Country, tm.IP, tm.InputTokens, tm.OutputTokens)
 	}
 
 	// create the process groups
@@ -309,6 +318,10 @@ func (pm *ProxyManager) setupGinEngine() {
 
 	pm.ginEngine.GET("/v1/models", pm.apiKeyAuth(), pm.listModelsHandler)
 
+	// per-client token usage analytics (admin-only)
+	pm.ginEngine.GET("/usage", pm.apiKeyAuth(), pm.usageHandler)
+	pm.ginEngine.POST("/usage/reset", pm.apiKeyAuth(), pm.usageResetHandler)
+
 	// in proxymanager_loghandlers.go
 	pm.ginEngine.GET("/logs", pm.apiKeyAuth(), pm.sendLogsHandlers)
 	pm.ginEngine.GET("/logs/stream", pm.apiKeyAuth(), pm.streamLogsHandler)
@@ -326,6 +339,11 @@ func (pm *ProxyManager) setupGinEngine() {
 	})
 	pm.ginEngine.Any("/upstream/*upstreamPath", pm.apiKeyAuth(), pm.proxyToUpstream)
 	pm.ginEngine.GET("/unload", pm.apiKeyAuth(), pm.unloadAllModelsHandler)
+	// POST /models/unload — same contract as the native llama.cpp router
+	// ({"model":"<id>"} -> {"success":true}); makes the pool transparent for
+	// unload and PROPAGATES it to the peer that owns the model. Empty model =
+	// unload everything (local + every peer). See routerUnloadHandler.
+	pm.ginEngine.POST("/models/unload", pm.apiKeyAuth(), pm.routerUnloadHandler)
 	pm.ginEngine.GET("/running", pm.apiKeyAuth(), pm.listRunningProcessesHandler)
 	pm.ginEngine.GET("/health", func(c *gin.Context) {
 		c.String(http.StatusOK, "OK")
@@ -488,6 +506,11 @@ func (pm *ProxyManager) listModelsHandler(c *gin.Context) {
 	}
 
 	if pm.peerProxy != nil {
+		// Refresh all peers' loaded-state CONCURRENTLY up front, so a dead/slow
+		// peer can't serialize this union behind a chain of per-peer dial
+		// timeouts (a down titan peer once wedged the union 35s+ → pool looked
+		// down). After this, the per-peer reads below are cache hits.
+		pm.peerProxy.WarmLoaded()
 		for peerID, peer := range pm.peerProxy.ListPeers() {
 			// add peer models
 			for _, modelID := range peer.Models {
@@ -499,6 +522,66 @@ func (pm *ProxyManager) listModelsHandler(c *gin.Context) {
 					},
 				})
 
+				// Stamp live loaded-status so aggregating clients can group
+				// "loaded" (VRAM-resident) models. Only set when actually
+				// loaded — absence reads as "not loaded" downstream.
+				if pm.peerProxy.IsPeerModelLoaded(peerID, modelID) {
+					record["status"] = gin.H{"value": "loaded"}
+				}
+
+				// Expose the node name (= peerID for node-router peers) so the FE
+				// can resolve per-node VRAM from gpu-metrics-api/DCGM. A
+				// cross-cluster federated peer won't match the home DCGM,
+				// which is correct — its VRAM lives on another cluster.
+				if meta, mok := record["meta"].(gin.H); mok {
+					if ls, lok := meta["llamaswap"].(map[string]any); lok {
+						ls["node_name"] = peerID
+					}
+				}
+
+				// Propagate the peer's advertised modality signature so clients
+				// can group/route by capability (vision, omni, image-out, ...).
+				// The bare peer model-id list drops the source node-router's
+				// `architecture` block; re-stamp it here, both as a top-level
+				// `architecture` (mirrors the source shape) and folded into
+				// meta.llamaswap alongside peerID (what the webui reads from the
+				// surviving meta block).
+				if in, out, ok := pm.peerProxy.PeerModelModality(peerID, modelID); ok {
+					record["architecture"] = gin.H{
+						"input_modalities":  in,
+						"output_modalities": out,
+					}
+					if meta, mok := record["meta"].(gin.H); mok {
+						if ls, lok := meta["llamaswap"].(map[string]any); lok {
+							ls["input_modalities"] = in
+							ls["output_modalities"] = out
+						}
+					}
+				}
+
+				// Propagate size/context dims (from the node-router model meta)
+				// into meta.llamaswap so the picker can show a context slider
+				// + compute VRAM feasibility. Loaded models only (cold report
+				// no meta upstream — see PeerModelDims).
+				if dim, ok := pm.peerProxy.PeerModelDims(peerID, modelID); ok {
+					if meta, mok := record["meta"].(gin.H); mok {
+						if ls, lok := meta["llamaswap"].(map[string]any); lok {
+							ls["n_ctx"] = dim.NCtx
+							ls["n_ctx_train"] = dim.NCtxTrain
+							ls["weights_bytes"] = dim.WeightBytes
+							ls["n_params"] = dim.NParams
+							ls["n_embd"] = dim.NEmbd
+							// KV geometry + live cache quant → exact KV bytes/token.
+							ls["n_layer"] = dim.NLayer
+							ls["n_head_kv"] = dim.NHeadKV
+							ls["n_embd_k_gqa"] = dim.NEmbdKGqa
+							ls["n_embd_v_gqa"] = dim.NEmbdVGqa
+							ls["cache_type_k"] = dim.CacheTypeK
+							ls["cache_type_v"] = dim.CacheTypeV
+						}
+					}
+				}
+
 				data = append(data, record)
 			}
 		}
@@ -509,19 +592,25 @@ func (pm *ProxyManager) listModelsHandler(c *gin.Context) {
 		// Kept tight (loaded models only) to avoid bloating the listing.
 		for _, peerID := range pm.peerProxy.PeerOrder() {
 			seen := map[string]bool{}
-			addAddr := func(addr string) {
+			addAddr := func(addr string, loaded bool) {
 				if seen[addr] {
 					return
 				}
 				seen[addr] = true
-				data = append(data, newRecord(addr, config.ModelConfig{
+				rec := newRecord(addr, config.ModelConfig{
 					Name:     fmt.Sprintf("node %s", peerID),
 					Metadata: map[string]any{"peerID": peerID, "nodeAddress": true},
-				}))
+				})
+				// A `<loaded-id>@<node>` address is loaded by construction; the
+				// `any@<node>` wildcard is a router alias, not itself resident.
+				if loaded {
+					rec["status"] = gin.H{"value": "loaded"}
+				}
+				data = append(data, rec)
 			}
-			addAddr(anyAlias + "@" + peerID)
+			addAddr(anyAlias+"@"+peerID, false)
 			for _, loadedID := range pm.peerProxy.LoadedModels(peerID) {
-				addAddr(loadedID + "@" + peerID)
+				addAddr(loadedID+"@"+peerID, true)
 			}
 		}
 	}
@@ -790,6 +879,9 @@ func (pm *ProxyManager) proxyInferenceHandler(c *gin.Context) {
 	isStreaming := gjson.GetBytes(bodyBytes, "stream").Bool()
 	ctx := context.WithValue(c.Request.Context(), proxyCtxKey("streaming"), isStreaming)
 	ctx = context.WithValue(ctx, proxyCtxKey("model"), modelID)
+	ctx = context.WithValue(ctx, proxyCtxKey("client"), c.GetString("client"))   // usage attribution
+	ctx = context.WithValue(ctx, proxyCtxKey("country"), c.GetString("country")) // geo attribution
+	ctx = context.WithValue(ctx, proxyCtxKey("ip"), c.GetString("ip"))           // source IP
 	c.Request = c.Request.WithContext(ctx)
 
 	if pm.metricsMonitor != nil && c.Request.Method == "POST" && shouldCollectMetrics(c.Request.URL.Path) {
@@ -1009,6 +1101,35 @@ func (pm *ProxyManager) apiKeyAuth() gin.HandlerFunc {
 		if !valid {
 			c.Header("WWW-Authenticate", `Basic realm="llama-swap"`)
 			pm.sendErrorResponse(c, http.StatusUnauthorized, "unauthorized: invalid or missing API key")
+			c.Abort()
+			return
+		}
+
+		// Attribute this request to a client LABEL for usage analytics — by key
+		// fingerprint (sha256 prefix), never the raw key. Unlabelled keys bucket
+		// under their fingerprint so they're still distinguished.
+		fp := keyFingerprint(providedKey)
+		label := pm.config.APIKeyLabels[fp]
+		if label == "" {
+			label = fp
+		}
+		c.Set("client", label)
+		// Country + source IP come from Cloudflare's edge (Cf-IPCountry /
+		// Cf-Connecting-Ip) when via the tunnel; fall back to gin's ClientIP for
+		// LAN/direct requests.
+		c.Set("country", c.GetHeader("Cf-IPCountry"))
+		ip := c.GetHeader("Cf-Connecting-Ip")
+		if ip == "" {
+			ip = c.ClientIP()
+		}
+		c.Set("ip", ip)
+
+		// Per-client rate limit on inference (POST). DISABLED by default — the
+		// limiter is only consulted when an operator configures a limit, so this
+		// is a no-op until then and can't 429 legit traffic.
+		if c.Request.Method == http.MethodPost && pm.rateLimiter.enabled() && !pm.rateLimiter.allow(label) {
+			c.Header("Retry-After", "60")
+			pm.sendErrorResponse(c, http.StatusTooManyRequests, "rate limit exceeded for this key")
 			c.Abort()
 			return
 		}

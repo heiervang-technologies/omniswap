@@ -10,6 +10,7 @@ import (
 	"mime/multipart"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strconv"
 	"strings"
 	"sync"
@@ -329,6 +330,117 @@ func TestProxyManager_ListModelsHandler(t *testing.T) {
 	assert.Empty(t, expectedModels, "not all expected models were returned")
 }
 
+// When a peer reports a model as loaded, /v1/models stamps status.value=loaded
+// on that peer model entry and on its `<id>@<node>` address — but not on the
+// unloaded sibling or the `any@<node>` wildcard. This drives the "loaded
+// models" grouping in aggregating clients (heierchat) with no per-node config.
+func TestProxyManager_ListModelsHandler_LoadedStatusEnrichment(t *testing.T) {
+	cfg := config.Config{
+		HealthCheckTimeout: 15,
+		Peers: map[string]config.PeerConfig{
+			"crystal": {
+				Proxy:  "http://crystal:8080",
+				Models: []string{"gemma-4-12b", "qwen3-4b"},
+			},
+		},
+		LogLevel: "error",
+	}
+
+	proxy := New(cfg)
+
+	// Seed the loaded-state cache so "gemma-4-12b" reports loaded on crystal,
+	// fresh enough that peerLoaded serves it without a live network fetch.
+	proxy.peerProxy.loadedMu.Lock()
+	proxy.peerProxy.loadedCache["crystal"] = peerLoadedSet{
+		order:     []string{"gemma-4-12b"},
+		all:       map[string]bool{"gemma-4-12b": true},
+		fetchedAt: time.Now(),
+	}
+	proxy.peerProxy.loadedMu.Unlock()
+
+	req := httptest.NewRequest("GET", "/v1/models", nil)
+	w := CreateTestResponseRecorder()
+	proxy.ServeHTTP(w, req)
+	assert.Equal(t, http.StatusOK, w.Code)
+
+	var response struct {
+		Data []map[string]interface{} `json:"data"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &response); err != nil {
+		t.Fatalf("Failed to parse JSON response: %v", err)
+	}
+
+	statusByID := map[string]string{}
+	present := map[string]bool{}
+	for _, m := range response.Data {
+		id, _ := m["id"].(string)
+		present[id] = true
+		if s, ok := m["status"].(map[string]interface{}); ok {
+			if v, ok := s["value"].(string); ok {
+				statusByID[id] = v
+			}
+		}
+	}
+
+	// Loaded peer model + its node-address carry status.value=loaded.
+	assert.Equal(t, "loaded", statusByID["gemma-4-12b"], "loaded peer model should carry status.value=loaded")
+	assert.Equal(t, "loaded", statusByID["gemma-4-12b@crystal"], "loaded node-address should carry status.value=loaded")
+	assert.True(t, present["gemma-4-12b@crystal"], "expected node-address alias gemma-4-12b@crystal present")
+
+	// The unloaded sibling and the wildcard alias must NOT be stamped loaded.
+	_, hasUnloaded := statusByID["qwen3-4b"]
+	assert.False(t, hasUnloaded, "unloaded peer model should not carry a loaded status")
+	_, hasWildcard := statusByID["any@crystal"]
+	assert.False(t, hasWildcard, "any@node wildcard should not be stamped loaded")
+}
+
+// `<model>@<node>` resolves for ANY model the peer advertises (loaded or cold),
+// not just static-config or currently-loaded entries — the generic "pin node,
+// pick model" routing primitive. A model the peer does not advertise still 400s.
+func TestPeerProxy_ResolveAddress_GenericModelAtNode(t *testing.T) {
+	cfg := config.Config{
+		HealthCheckTimeout: 15,
+		Peers: map[string]config.PeerConfig{
+			"crystal": {
+				Proxy:  "http://crystal:8080",
+				Models: []string{"gemma-4-12b"}, // static config declares only one
+			},
+		},
+		LogLevel: "error",
+	}
+	proxy := New(cfg)
+	pp := proxy.peerProxy
+
+	// crystal advertises a COLD model 'qwen3-30b' (served, not loaded) alongside
+	// the loaded 'gemma-4-12b'. Seed fresh so peerLoaded serves it without a fetch.
+	pp.loadedMu.Lock()
+	pp.loadedCache["crystal"] = peerLoadedSet{
+		order:     []string{"gemma-4-12b"},
+		all:       map[string]bool{"gemma-4-12b": true},
+		served:    map[string]bool{"gemma-4-12b": true, "qwen3-30b": true},
+		fetchedAt: time.Now(),
+	}
+	pp.loadedMu.Unlock()
+
+	// Cold-but-advertised model resolves to the peer (it cold-loads on dispatch).
+	res, err := pp.ResolveAddress("qwen3-30b@crystal")
+	assert.NoError(t, err)
+	assert.Equal(t, "crystal", res.PeerID)
+	assert.Equal(t, "qwen3-30b", res.Model)
+	assert.True(t, res.Rewrote)
+
+	// Static-config model still resolves.
+	res, err = pp.ResolveAddress("gemma-4-12b@crystal")
+	assert.NoError(t, err)
+	assert.Equal(t, "crystal", res.PeerID)
+	assert.Equal(t, "gemma-4-12b", res.Model)
+
+	// A model the peer does NOT advertise fails fast with 400.
+	_, err = pp.ResolveAddress("not-a-real-model@crystal")
+	assert.Error(t, err)
+	assert.Equal(t, http.StatusBadRequest, addrErrorCode(err))
+}
+
 func TestProxyManager_ListModelsHandler_WithMetadata(t *testing.T) {
 	// Process config through LoadConfigFromReader to apply macro substitution
 	configYaml := `
@@ -608,6 +720,108 @@ func TestProxyManager_Unload(t *testing.T) {
 		t.Fatal("timeout waiting for model1 to stop")
 	}
 	assert.Equal(t, proxy.processGroups[config.DEFAULT_GROUP_ID].processes["model1"].CurrentState(), StateStopped)
+}
+
+// POST /models/unload must PROPAGATE to the peer that owns the model — both for
+// a named peer model and a node-pinned <model>@<node> address (with @node
+// stripped before forwarding). Regression guard for the "can't unload a gem
+// model from the pool" bug.
+func TestProxyManager_RouterUnload_ForwardsToPeer(t *testing.T) {
+	var gotPath, gotBody string
+	peerSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotPath = r.URL.Path
+		buf := new(bytes.Buffer)
+		buf.ReadFrom(r.Body)
+		gotBody = buf.String()
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte(`{"success":true}`))
+	}))
+	defer peerSrv.Close()
+
+	peerURL, _ := url.Parse(peerSrv.URL)
+	cfg := config.Config{
+		HealthCheckTimeout: 15,
+		Peers: map[string]config.PeerConfig{
+			"gem": {
+				Proxy:    peerSrv.URL,
+				ProxyURL: peerURL, // struct-literal config skips the YAML Proxy->ProxyURL parse
+				Models:   []string{"gemma-4-12b-256k"},
+			},
+		},
+		LogLevel: "error",
+	}
+	proxy := New(cfg)
+
+	// (1) named peer model -> forwarded to the owning peer, same /models/unload path.
+	req := httptest.NewRequest("POST", "/models/unload", bytes.NewBufferString(`{"model":"gemma-4-12b-256k"}`))
+	w := CreateTestResponseRecorder()
+	proxy.ServeHTTP(w, req)
+	assert.Equal(t, http.StatusOK, w.Code)
+	assert.Equal(t, "/models/unload", gotPath)
+	assert.Contains(t, gotBody, "gemma-4-12b-256k")
+	assert.Equal(t, `{"success":true}`, w.Body.String())
+
+	// (2) node-pinned address: @gem is stripped from the forwarded body.
+	gotPath, gotBody = "", ""
+	req = httptest.NewRequest("POST", "/models/unload", bytes.NewBufferString(`{"model":"gemma-4-12b-256k@gem"}`))
+	w = CreateTestResponseRecorder()
+	proxy.ServeHTTP(w, req)
+	assert.Equal(t, http.StatusOK, w.Code)
+	assert.Equal(t, "/models/unload", gotPath)
+	assert.Contains(t, gotBody, `"gemma-4-12b-256k"`)
+	assert.NotContains(t, gotBody, "@gem")
+}
+
+// An already-cold model on a peer router lacking idempotent-unload returns 4xx
+// "model is not running"; the pool must normalize that to 200 {already_unloaded}
+// so unload is idempotent regardless of peer version. A genuinely-unknown model
+// ("not found") must NOT be masked — it passes through as the real error.
+func TestProxyManager_RouterUnload_NormalizesAlreadyCold(t *testing.T) {
+	var peerStatus int
+	var peerBody string
+	peerSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(peerStatus)
+		w.Write([]byte(peerBody))
+	}))
+	defer peerSrv.Close()
+
+	peerURL, _ := url.Parse(peerSrv.URL)
+	cfg := config.Config{
+		HealthCheckTimeout: 15,
+		Peers: map[string]config.PeerConfig{
+			"gem": {Proxy: peerSrv.URL, ProxyURL: peerURL, Models: []string{"gemma-4-12b-256k"}},
+		},
+		LogLevel: "error",
+	}
+	proxy := New(cfg)
+
+	do := func(model string) (int, string) {
+		req := httptest.NewRequest("POST", "/models/unload", bytes.NewBufferString(`{"model":"`+model+`"}`))
+		w := CreateTestResponseRecorder()
+		proxy.ServeHTTP(w, req)
+		return w.Code, w.Body.String()
+	}
+
+	// already-cold (400 "not running") -> normalized to 200 already_unloaded, both forms
+	peerStatus, peerBody = http.StatusBadRequest, `{"error":{"message":"model is not running"}}`
+	code, body := do("gemma-4-12b-256k@gem")
+	assert.Equal(t, http.StatusOK, code, "@peer not-running must normalize to 200")
+	assert.Contains(t, body, "already_unloaded")
+	code, body = do("gemma-4-12b-256k")
+	assert.Equal(t, http.StatusOK, code, "bare not-running must normalize to 200")
+	assert.Contains(t, body, "already_unloaded")
+
+	// genuinely-unknown (400 "not found") -> passed through, NOT masked
+	peerStatus, peerBody = http.StatusBadRequest, `{"error":{"message":"model is not found"}}`
+	code, body = do("gemma-4-12b-256k@gem")
+	assert.Equal(t, http.StatusBadRequest, code, "not-found must pass through")
+	assert.Contains(t, body, "not found")
+
+	// success passes through untouched
+	peerStatus, peerBody = http.StatusOK, `{"success":true}`
+	code, body = do("gemma-4-12b-256k@gem")
+	assert.Equal(t, http.StatusOK, code)
+	assert.Contains(t, body, "success")
 }
 
 func TestProxyManager_UnloadSingleModel(t *testing.T) {

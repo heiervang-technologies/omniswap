@@ -148,6 +148,28 @@ type Config struct {
 	// support API keys, see issue #433, #50, #251
 	RequiredAPIKeys []string `yaml:"apiKeys"`
 
+	// APIKeyLabels maps a key FINGERPRINT (sha256 prefix, not the raw key) to a
+	// human label, so per-client usage analytics can attribute tokens to e.g.
+	// "shay"/"markus" without storing the secret. Optional; unlabelled keys are
+	// bucketed under their fingerprint.
+	APIKeyLabels map[string]string `yaml:"apiKeyLabels"`
+
+	// UsagePath is where the per-client usage rollup is persisted (so it survives
+	// restarts). Empty = in-memory only.
+	UsagePath string `yaml:"usagePath"`
+
+	// UsageReaders lists the client LABELS allowed to read GET /usage (the usage
+	// analytics expose who-used-what, so they're admin-only). Empty -> only the
+	// label "admin" may read it. Any other valid key gets 403.
+	UsageReaders []string `yaml:"usageReaders"`
+
+	// RateLimitPerMin caps inference (POST) requests per client per minute. 0 (the
+	// default) DISABLES rate limiting entirely — the limiter is a no-op, so it can
+	// never 429 legit traffic until an operator opts in. Per-label overrides:
+	// RateLimitOverrides[label] wins over the default.
+	RateLimitPerMin    int            `yaml:"rateLimitPerMin"`
+	RateLimitOverrides map[string]int `yaml:"rateLimitOverrides"`
+
 	// support remote peers, see issue #433, #296
 	Peers PeerDictionaryConfig `yaml:"peers"`
 }
