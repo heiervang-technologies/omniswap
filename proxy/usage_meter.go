@@ -261,21 +261,53 @@ func (m *UsageMeter) Record(client, model, country, ip string, inTok, outTok int
 
 // Snapshot returns a JSON-serialisable view for the /usage endpoint: the
 // per-client rollup plus a deterministically-ordered client list and totals.
+//
+// It DEEP-COPIES the rollup maps under the lock so the returned value is fully
+// independent of the live maps. The caller (usageHandler) marshals the result
+// to JSON without the lock, while Record() keeps mutating the live maps — if we
+// returned the live maps here, that concurrent map read (marshal) + write
+// (Record) would be a fatal "concurrent map read and map write" runtime panic
+// that crashes the pool (regression-guarded by TestUsageMeter_ConcurrentSnapshotMarshal).
 func (m *UsageMeter) Snapshot() map[string]any {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
+	clients := make(map[string]*clientUsage, len(m.clients))
 	order := make([]string, 0, len(m.clients))
 	var totReq, totIn, totOut int64
 	for c, cu := range m.clients {
+		byModel := make(map[string]*modelUsage, len(cu.ByModel))
+		for mdl, mdu := range cu.ByModel {
+			cp := *mdu
+			byModel[mdl] = &cp
+		}
+		clients[c] = &clientUsage{
+			Requests:     cu.Requests,
+			InputTokens:  cu.InputTokens,
+			OutputTokens: cu.OutputTokens,
+			ByModel:      byModel,
+			FirstSeen:    cu.FirstSeen,
+			LastSeen:     cu.LastSeen,
+		}
 		order = append(order, c)
 		totReq += cu.Requests
 		totIn += cu.InputTokens
 		totOut += cu.OutputTokens
 	}
+	countries := make(map[string]*modelUsage, len(m.countries))
+	for k, v := range m.countries {
+		cp := *v
+		countries[k] = &cp
+	}
+	ips := make(map[string]*ipUsage, len(m.ips))
+	for k, v := range m.ips {
+		cp := *v
+		ips[k] = &cp
+	}
+
 	sort.Slice(order, func(i, j int) bool {
 		// busiest first (by total tokens), then name
-		a, b := m.clients[order[i]], m.clients[order[j]]
+		a, b := clients[order[i]], clients[order[j]]
 		ai, bj := a.InputTokens+a.OutputTokens, b.InputTokens+b.OutputTokens
 		if ai != bj {
 			return ai > bj
@@ -285,9 +317,9 @@ func (m *UsageMeter) Snapshot() map[string]any {
 	return map[string]any{
 		"as_of":      time.Now().UTC().Format(time.RFC3339),
 		"order":      order,
-		"clients":    m.clients,
-		"by_country": m.countries,
-		"by_ip":      m.ips,
+		"clients":    clients,
+		"by_country": countries,
+		"by_ip":      ips,
 		"totals": map[string]int64{
 			"requests":      totReq,
 			"input_tokens":  totIn,

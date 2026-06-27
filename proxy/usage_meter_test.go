@@ -1,6 +1,7 @@
 package proxy
 
 import (
+	"encoding/json"
 	"path/filepath"
 	"testing"
 
@@ -59,6 +60,38 @@ func TestUsageMeter_RecordAggregatePersist(t *testing.T) {
 	m2 := NewUsageMeter(path, nil)
 	s2 := m2.Snapshot()["clients"].(map[string]*clientUsage)
 	assert.EqualValues(t, 117, s2["shay"].InputTokens, "usage should survive a restart")
+}
+
+// TestUsageMeter_ConcurrentSnapshotMarshal guards the /usage path: the dashboard
+// polls Snapshot() and marshals it to JSON while live inference traffic calls
+// Record() concurrently. Snapshot() must return data INDEPENDENT of the live
+// maps — if it leaks the live maps, json.Marshal reads them while Record writes,
+// which is a data race and a fatal "concurrent map read and map write" panic
+// that crashes the pool. Run under -race to catch the leak.
+func TestUsageMeter_ConcurrentSnapshotMarshal(t *testing.T) {
+	m := NewUsageMeter("", nil) // no persistence path -> no flush goroutine
+
+	done := make(chan struct{})
+	go func() { // writer: hammer Record like live inference does
+		for {
+			select {
+			case <-done:
+				return
+			default:
+				m.Record("shay", "gemma-4-12b", "NO", "1.2.3.4", 10, 5)
+				m.Record("markus", "qwen3.6-35b-a3b", "US", "8.8.8.8", 1, 1)
+			}
+		}
+	}()
+
+	// reader: Snapshot + marshal exactly as usageHandler does, concurrently.
+	for i := 0; i < 3000; i++ {
+		if _, err := json.Marshal(m.Snapshot()); err != nil {
+			close(done)
+			t.Fatalf("marshal snapshot: %v", err)
+		}
+	}
+	close(done)
 }
 
 func TestKeyFingerprint_StableNonReversible(t *testing.T) {
