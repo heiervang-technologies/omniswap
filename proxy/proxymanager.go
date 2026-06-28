@@ -622,10 +622,9 @@ func (pm *ProxyManager) listModelsHandler(c *gin.Context) {
 		return si < sj
 	})
 
-	// Set CORS headers if origin exists
-	if origin := c.GetHeader("Origin"); origin != "" {
-		c.Header("Access-Control-Allow-Origin", origin)
-	}
+	// Set CORS headers if origin exists. listModelsHandler builds the response
+	// locally (no upstream proxy), so this is the only ACAO setter on its path.
+	corsEchoOrigin(c)
 
 	// Use gin's JSON method which handles content-type and encoding
 	c.JSON(http.StatusOK, gin.H{
@@ -1052,6 +1051,20 @@ func (pm *ProxyManager) sendErrorResponse(c *gin.Context, statusCode int, messag
 	}
 }
 
+// corsEchoOrigin reflects the request Origin into Access-Control-Allow-Origin so
+// a cross-origin (browser) caller can READ the response body/status. Call this on
+// handler error paths that abort BEFORE the request reaches the upstream proxy —
+// the OPTIONS preflight middleware only covers preflight, and the upstream
+// llama-server echoes Origin itself on proxied (200) responses, so without this an
+// auth 401/429 reaches the browser with no ACAO header and is masked as an opaque
+// "Failed to fetch" instead of the real status. MUST NOT be called on the proxied
+// success path (the upstream already sets ACAO → a second header = CORS error).
+func corsEchoOrigin(c *gin.Context) {
+	if origin := c.GetHeader("Origin"); origin != "" {
+		c.Header("Access-Control-Allow-Origin", origin)
+	}
+}
+
 // apiKeyAuth returns a middleware that validates API keys if configured.
 // Returns a pass-through handler if no API keys are configured.
 func (pm *ProxyManager) apiKeyAuth() gin.HandlerFunc {
@@ -1099,6 +1112,7 @@ func (pm *ProxyManager) apiKeyAuth() gin.HandlerFunc {
 		}
 
 		if !valid {
+			corsEchoOrigin(c) // let the browser read the 401 instead of "Failed to fetch"
 			c.Header("WWW-Authenticate", `Basic realm="llama-swap"`)
 			pm.sendErrorResponse(c, http.StatusUnauthorized, "unauthorized: invalid or missing API key")
 			c.Abort()
@@ -1128,6 +1142,7 @@ func (pm *ProxyManager) apiKeyAuth() gin.HandlerFunc {
 		// limiter is only consulted when an operator configures a limit, so this
 		// is a no-op until then and can't 429 legit traffic.
 		if c.Request.Method == http.MethodPost && pm.rateLimiter.enabled() && !pm.rateLimiter.allow(label) {
+			corsEchoOrigin(c) // let the browser read the 429 instead of "Failed to fetch"
 			c.Header("Retry-After", "60")
 			pm.sendErrorResponse(c, http.StatusTooManyRequests, "rate limit exceeded for this key")
 			c.Abort()

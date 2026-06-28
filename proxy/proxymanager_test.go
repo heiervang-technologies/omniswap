@@ -1548,6 +1548,28 @@ func TestProxyManager_APIKeyAuth(t *testing.T) {
 		assert.Equal(t, http.StatusUnauthorized, w.Code)
 		assert.Equal(t, `Basic realm="llama-swap"`, w.Header().Get("WWW-Authenticate"))
 	})
+
+	// Regression: a cross-origin auth failure must carry Access-Control-Allow-Origin
+	// or the browser masks the 401 as an opaque "Failed to fetch" (the apiKeyAuth
+	// abort runs before the proxy/handler that would otherwise echo Origin).
+	t.Run("401 echoes Origin into Access-Control-Allow-Origin", func(t *testing.T) {
+		req := httptest.NewRequest("POST", "/v1/chat/completions", bytes.NewBufferString(`{"model":"model1"}`))
+		req.Header.Set("Origin", "https://editor.example")
+		w := CreateTestResponseRecorder()
+
+		proxy.ServeHTTP(w, req)
+		assert.Equal(t, http.StatusUnauthorized, w.Code)
+		assert.Equal(t, "https://editor.example", w.Header().Get("Access-Control-Allow-Origin"))
+	})
+
+	t.Run("401 without Origin sets no Access-Control-Allow-Origin", func(t *testing.T) {
+		req := httptest.NewRequest("POST", "/v1/chat/completions", bytes.NewBufferString(`{"model":"model1"}`))
+		w := CreateTestResponseRecorder()
+
+		proxy.ServeHTTP(w, req)
+		assert.Equal(t, http.StatusUnauthorized, w.Code)
+		assert.Empty(t, w.Header().Get("Access-Control-Allow-Origin"))
+	})
 }
 
 func TestProxyManager_APIKeyAuth_Disabled(t *testing.T) {
