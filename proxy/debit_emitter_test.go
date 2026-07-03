@@ -3,6 +3,7 @@ package proxy
 import (
 	"path/filepath"
 	"regexp"
+	"sync"
 	"sync/atomic"
 	"testing"
 
@@ -46,6 +47,36 @@ func TestDebitEmitter_DrainsToSink(t *testing.T) {
 	require.Len(t, got, 5)
 	assert.Equal(t, []uint64{1, 2, 3, 4, 5}, []uint64{got[0].Seq, got[1].Seq, got[2].Seq, got[3].Seq, got[4].Seq})
 	assert.Zero(t, e.droppedCount())
+	assert.Equal(t, int64(5), e.appendedCount())
+	assert.Zero(t, e.failedCount())
+}
+
+// TestDebitEmitter_ConcurrentEmitDuringClose locks in the Emit/Close race
+// guarantee: many goroutines Emit while Close runs concurrently — under -race
+// this must not panic (send-on-closed) or data-race. Assertion is the clean run
+// itself; accepted events (appended + dropped) never exceed what was offered.
+func TestDebitEmitter_ConcurrentEmitDuringClose(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "debits.jsonl")
+	dl := newDebitLog(path, testLogger)
+	defer dl.close()
+	e := newDebitEmitter(dl, 128, testLogger)
+
+	const goroutines, per = 8, 50
+	var wg sync.WaitGroup
+	for i := 0; i < goroutines; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for j := 0; j < per; j++ {
+				e.Emit(sampleEvent("r"))
+			}
+		}()
+	}
+	e.Close() // races the Emit storm
+	wg.Wait()
+
+	assert.NotPanics(t, func() { e.Emit(sampleEvent("late")) })
+	assert.LessOrEqual(t, e.appendedCount()+e.droppedCount(), int64(goroutines*per))
 }
 
 // TestDebitEmitter_OverflowDropsBounded: a full buffer sheds the excess (counted,

@@ -15,14 +15,26 @@ import (
 // onRecord hook (the request path) would add that latency to every request.
 // debitEmitter decouples them: Emit() is a non-blocking push onto a buffered
 // channel drained by ONE background writer goroutine that calls Append. A single
-// writer keeps appends serialized (Seq stays monotonic) and lets fsyncs batch
-// naturally under load.
+// writer keeps appends serialized so Seq stays monotonic.
+//
+// The writer fsyncs ONCE PER EVENT (Append is per-event) — NOT batched. Real
+// drain-batching (one fsync per drained run of events) is a deferred throughput
+// lever, not done here on purpose: doing it correctly needs an atomic multi-line
+// write with rollback, or a partial write reuses/gaps a Seq (a worse failure than
+// the fsync cost it saves). That per-event fsync is the writer's throughput
+// ceiling — a go-live sizing check (confirm it clears peak request rate, else add
+// atomic drain-batching then).
 //
 // Overflow is bounded + LOUD, never blocking: if the buffer is full (writer
 // can't keep up — a slow disk), Emit drops the event and counts it. That is an
 // under-bill (customer-favourable, self-corrects at next top-up), logged, never
 // a stalled response and never a silent loss. Close() drains the buffer and
 // waits for the writer, so a clean shutdown loses nothing in flight.
+//
+// Crash-loss window: async widens it from one event (sync Append) to up to
+// bufSize events buffered-but-not-yet-fsync'd, lost on a HARD crash. Still
+// watermark-safe — those events were never Appended so never got a Seq, so there
+// is no gap, only a bounded under-bill. Size bufSize deliberately against that.
 
 // debitAppender is the durable sink the emitter writes to (debitLog satisfies
 // it). An interface so the writer's concurrency can be tested against a
@@ -32,13 +44,15 @@ type debitAppender interface {
 }
 
 type debitEmitter struct {
-	sink    debitAppender
-	ch      chan DebitEvent
-	logger  *LogMonitor
-	wg      sync.WaitGroup
-	dropped int64        // events dropped on overflow (atomic)
-	closeMu sync.RWMutex // RLock: Emit; Lock: Close (drains all Emits before closing ch)
-	closed  bool
+	sink     debitAppender
+	ch       chan DebitEvent
+	logger   *LogMonitor
+	wg       sync.WaitGroup
+	dropped  int64        // events dropped on overflow (atomic)
+	appended int64        // events durably Appended by the writer (atomic)
+	failed   int64        // events the writer could not Append, e.g. disk error (atomic)
+	closeMu  sync.RWMutex // RLock: Emit; Lock: Close (drains all Emits before closing ch)
+	closed   bool
 }
 
 // newDebitEmitter starts the background writer draining into sink. bufSize is the
@@ -57,9 +71,14 @@ func newDebitEmitter(sink debitAppender, bufSize int, logger *LogMonitor) *debit
 func (e *debitEmitter) run() {
 	defer e.wg.Done()
 	for ev := range e.ch {
-		if _, err := e.sink.Append(ev); err != nil && e.logger != nil {
-			e.logger.Warnf("debit emitter: append failed (event %s lost): %v", ev.RequestID, err)
+		if _, err := e.sink.Append(ev); err != nil {
+			n := atomic.AddInt64(&e.failed, 1)
+			if e.logger != nil {
+				e.logger.Warnf("debit emitter: append failed (event %s lost, total failed %d): %v", ev.RequestID, n, err)
+			}
+			continue
 		}
+		atomic.AddInt64(&e.appended, 1)
 	}
 }
 
@@ -99,6 +118,13 @@ func (e *debitEmitter) Close() {
 
 // droppedCount is the number of events shed on overflow (observability).
 func (e *debitEmitter) droppedCount() int64 { return atomic.LoadInt64(&e.dropped) }
+
+// appendedCount is the number of events durably written by the writer.
+func (e *debitEmitter) appendedCount() int64 { return atomic.LoadInt64(&e.appended) }
+
+// failedCount is the number of events the writer could not persist (e.g. a disk
+// error) — distinct from overflow drops; both are under-bills, surfaced for 2b.
+func (e *debitEmitter) failedCount() int64 { return atomic.LoadInt64(&e.failed) }
 
 // mintRequestID returns a random RFC-4122 v4 UUID string — the per-event
 // idempotency key finance dedupes on (credit_debits.request_id UNIQUE).
