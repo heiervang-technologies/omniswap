@@ -170,6 +170,19 @@ type Config struct {
 	RateLimitPerMin    int            `yaml:"rateLimitPerMin"`
 	RateLimitOverrides map[string]int `yaml:"rateLimitOverrides"`
 
+	// MaxInflightPerPeer bounds the number of requests concurrently in flight to
+	// EACH pool peer. 0 (the default) DISABLES admission control entirely
+	// (land-dark) — unlimited concurrency, byte-identical to current behavior.
+	// When >0, a request that can't get a per-peer slot within QueueTimeout is
+	// rejected with 429 + Retry-After instead of piling onto a saturated peer
+	// (the baseline 502 + long-tail p99 at saturation).
+	MaxInflightPerPeer int `yaml:"maxInflightPerPeer"`
+	// QueueTimeout is how long a request waits for a free per-peer slot before it
+	// is rejected (429). A Go duration string (e.g. "2s", "500ms"). Empty (the
+	// default) = reject immediately when the peer is full (no queue wait). Only
+	// consulted when MaxInflightPerPeer > 0.
+	QueueTimeout string `yaml:"queueTimeout"`
+
 	// support remote peers, see issue #433, #296
 	Peers PeerDictionaryConfig `yaml:"peers"`
 }

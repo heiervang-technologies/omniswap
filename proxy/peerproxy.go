@@ -53,6 +53,11 @@ type PeerProxy struct {
 	loadedMu    sync.RWMutex
 	loadedCache map[string]peerLoadedSet
 	loadedTTL   time.Duration
+
+	// admission bounds concurrent in-flight requests per peer (429 + Retry-After
+	// on overflow). Disabled by default (see peer_admission.go); enabled at startup
+	// via setAdmission when the operator sets maxInflightPerPeer.
+	admission *peerAdmission
 }
 
 func NewPeerProxy(peers config.PeerDictionaryConfig, proxyLogger *LogMonitor) (*PeerProxy, error) {
@@ -168,7 +173,43 @@ func NewPeerProxy(peers config.PeerDictionaryConfig, proxyLogger *LogMonitor) (*
 		},
 		loadedCache: make(map[string]peerLoadedSet),
 		loadedTTL:   5 * time.Second,
+		// Admission disabled by default (land-dark); setAdmission enables it from
+		// the operator config after construction, before any request is served.
+		admission: newPeerAdmission(0, 0, peerIDs),
 	}, nil
+}
+
+// setAdmission enables (or replaces) per-peer in-flight admission control. Called
+// once at startup from the proxy manager with the operator config, BEFORE any
+// request is served (so no concurrency concern). maxInflight <= 0 leaves
+// admission disabled — the land-dark default.
+func (p *PeerProxy) setAdmission(maxInflight int, queueTimeout time.Duration) {
+	p.admission = newPeerAdmission(maxInflight, queueTimeout, p.peerOrder)
+	if maxInflight > 0 {
+		p.logger.Infof("peer admission: ENABLED — maxInflightPerPeer=%d queueTimeout=%s (429 + Retry-After on overflow)", maxInflight, queueTimeout)
+	}
+}
+
+// admitAndServe gates dispatch through the per-peer admission semaphore (when
+// enabled) before proxying to the peer. On queue-timeout it writes 429 +
+// Retry-After and does NOT proxy — turning peer saturation into fast, well-formed
+// backpressure instead of a pile-on (the baseline 502 + long-tail p99). A no-op
+// pass-through when admission is disabled (the default), so behavior is
+// byte-identical until an operator sets maxInflightPerPeer. The admission slot is
+// held for the full ServeHTTP duration (including a streamed response), which is
+// exactly the in-flight window being bounded.
+func (p *PeerProxy) admitAndServe(pp *peerProxyMember, writer http.ResponseWriter, request *http.Request) error {
+	if p.admission.enabled() {
+		release, ok := p.admission.acquire(pp.peerID, request.Context().Done())
+		if !ok {
+			p.logger.Debugf("peer admission: %s saturated (maxInflight=%d), 429", pp.peerID, p.admission.maxInflight)
+			writeTooManyRequests(writer, request, p.admission.queueTimeout)
+			return nil
+		}
+		defer release()
+	}
+	pp.reverseProxy.ServeHTTP(writer, request)
+	return nil
 }
 
 func (p *PeerProxy) HasPeerModel(modelID string) bool {
@@ -233,10 +274,10 @@ func (p *PeerProxy) ProxyRequest(model_id string, writer http.ResponseWriter, re
 	}
 
 	// pickPeerForModel already reserved (incremented inFlight on) pp; release it
-	// when the proxied request completes.
+	// when the proxied request completes (including on a 429 from admission — the
+	// slot is never taken in that case, only the pick reservation is released).
 	defer atomic.AddInt64(&pp.inFlight, -1)
-	pp.reverseProxy.ServeHTTP(writer, request)
-	return nil
+	return p.admitAndServe(pp, writer, request)
 }
 
 // pickPeerForModel selects which peer serves modelID among all peers that list
@@ -321,8 +362,7 @@ func (p *PeerProxy) ProxyRequestToPeer(peerID, modelID string, writer http.Respo
 	// real occupancy when ranking by-name requests for the same model.
 	atomic.AddInt64(&pp.inFlight, 1)
 	defer atomic.AddInt64(&pp.inFlight, -1)
-	pp.reverseProxy.ServeHTTP(writer, request)
-	return nil
+	return p.admitAndServe(pp, writer, request)
 }
 
 // PeerFilters returns the filters configured for a peer by id.

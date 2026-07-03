@@ -144,6 +144,18 @@ func New(proxyConfig config.Config) *ProxyManager {
 		proxyLogger.Errorf("Disabling Peering. Failed to create proxy peers: %v", err)
 		peerProxy = nil
 	}
+	// Per-peer admission control (land-dark: only active when maxInflightPerPeer>0).
+	if peerProxy != nil && proxyConfig.MaxInflightPerPeer > 0 {
+		queueTimeout := time.Duration(0)
+		if s := strings.TrimSpace(proxyConfig.QueueTimeout); s != "" {
+			if d, perr := time.ParseDuration(s); perr == nil {
+				queueTimeout = d
+			} else {
+				proxyLogger.Warnf("peer admission: invalid queueTimeout %q, using 0 (reject-when-full, no queue wait): %v", s, perr)
+			}
+		}
+		peerProxy.setAdmission(proxyConfig.MaxInflightPerPeer, queueTimeout)
+	}
 
 	pm := &ProxyManager{
 		config:    proxyConfig,
