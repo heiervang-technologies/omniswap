@@ -4,7 +4,9 @@ import (
 	"bufio"
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
+	"path/filepath"
 	"sync"
 	"time"
 )
@@ -89,17 +91,27 @@ func newDebitLog(path string, logger *LogMonitor) *debitLog {
 		return dl
 	}
 	dl.file = f
+	// Make the file's directory entry durable so a crash right after a
+	// first-create can't lose the freshly-created log file itself. One-time at
+	// startup, not per-append. Best-effort: a dir that can't be fsync'd (rare)
+	// doesn't disable the log.
+	if d, derr := os.Open(filepath.Dir(path)); derr == nil {
+		_ = d.Sync()
+		_ = d.Close()
+	}
 	if logger != nil {
 		logger.Infof("debit log: %s active (%d events restored, next seq %d)", path, len(dl.events), dl.seq+1)
 	}
 	return dl
 }
 
-// enabled reports whether the log is recording (a non-empty, openable path).
+// enabled reports whether the log is recording. Gated on the append handle (not
+// just the path) so it agrees with Append: after close() — or a bad path —
+// enabled() is false and Append no-ops, never a "says-enabled-but-drops" split.
 func (dl *debitLog) enabled() bool {
 	dl.mu.Lock()
 	defer dl.mu.Unlock()
-	return dl.path != ""
+	return dl.file != nil
 }
 
 // Append stamps ev with the next monotonic Seq, appends it in memory, and
@@ -110,8 +122,8 @@ func (dl *debitLog) enabled() bool {
 func (dl *debitLog) Append(ev DebitEvent) (DebitEvent, error) {
 	dl.mu.Lock()
 	defer dl.mu.Unlock()
-	if dl.path == "" || dl.file == nil {
-		return ev, nil // disabled: no-op
+	if dl.file == nil {
+		return ev, nil // disabled / closed: no-op
 	}
 	ev.Seq = dl.seq + 1
 	line, err := json.Marshal(ev)
@@ -153,9 +165,20 @@ func (dl *debitLog) highWater() uint64 {
 	return dl.seq
 }
 
-// load reads an existing JSONL file into memory and sets seq to the max Seq
-// seen. A missing file is fine (fresh start). Called under construction, before
-// the append handle is opened, so it takes no lock.
+// load reads an existing JSONL file into memory, sets seq to the max Seq seen,
+// and TRUNCATES any torn/trailing bytes past the last good, newline-terminated
+// record so the O_APPEND handle writes cleanly.
+//
+// The truncate is load-bearing, not cosmetic: without it a crash-torn final
+// fragment (bytes with no newline) survives, the next Append concatenates its
+// event onto the fragment into one corrupt merged line, and a LATER restart
+// then (a) loses every event from the corruption on and (b) resets maxSeq below
+// already-issued ordinals — so the next Append REUSES a Seq, corrupting the 2b
+// gap-free ack watermark. Stopping at the last good record and truncating the
+// tail keeps Seq strictly non-decreasing across any crash/restart sequence.
+//
+// A missing file is fine (fresh start). Called under construction, before the
+// append handle opens, so it takes no lock.
 func (dl *debitLog) load() error {
 	f, err := os.Open(dl.path)
 	if err != nil {
@@ -164,36 +187,52 @@ func (dl *debitLog) load() error {
 		}
 		return err
 	}
-	defer f.Close()
-
-	sc := bufio.NewScanner(f)
-	sc.Buffer(make([]byte, 0, 64*1024), 4*1024*1024) // tolerate long lines
-	var events []DebitEvent
-	var maxSeq uint64
-	for sc.Scan() {
-		line := sc.Bytes()
-		if len(line) == 0 {
-			continue
-		}
-		var ev DebitEvent
-		if err := json.Unmarshal(line, &ev); err != nil {
-			// A torn final line (crash mid-write) is the plausible cause; stop
-			// at the last good record rather than fail the whole restore.
-			if dl.logger != nil {
-				dl.logger.Warnf("debit log: skipping unparseable line during restore: %v", err)
-			}
-			break
-		}
-		events = append(events, ev)
-		if ev.Seq > maxSeq {
-			maxSeq = ev.Seq
-		}
-	}
-	if err := sc.Err(); err != nil {
+	fi, err := f.Stat()
+	if err != nil {
+		f.Close()
 		return err
 	}
+	fileSize := fi.Size()
+
+	r := bufio.NewReader(f)
+	var events []DebitEvent
+	var maxSeq uint64
+	var goodOffset int64 // bytes through the last good, newline-terminated record
+	for {
+		line, rerr := r.ReadBytes('\n')
+		if rerr == nil {
+			var ev DebitEvent
+			if json.Unmarshal(line, &ev) != nil {
+				break // corrupt complete line: stop; it + any tail get truncated
+			}
+			events = append(events, ev)
+			if ev.Seq > maxSeq {
+				maxSeq = ev.Seq
+			}
+			goodOffset += int64(len(line))
+			continue
+		}
+		if rerr == io.EOF {
+			break // trailing bytes w/o newline (torn fragment) are past goodOffset
+		}
+		f.Close()
+		return rerr // real read error
+	}
+	f.Close()
+
 	dl.events = events
 	dl.seq = maxSeq
+
+	// Truncate anything past the last good newline (torn fragment or a corrupt
+	// line and its tail) so the append handle can't merge onto it.
+	if goodOffset < fileSize {
+		if dl.logger != nil {
+			dl.logger.Warnf("debit log: truncating %d torn/trailing byte(s) past offset %d during restore", fileSize-goodOffset, goodOffset)
+		}
+		if err := os.Truncate(dl.path, goodOffset); err != nil {
+			return fmt.Errorf("debit log: truncate torn tail: %w", err)
+		}
+	}
 	return nil
 }
 

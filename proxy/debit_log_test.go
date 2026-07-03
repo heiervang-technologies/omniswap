@@ -159,6 +159,56 @@ func TestDebitLog_TornFinalLineTolerated(t *testing.T) {
 	assert.Equal(t, uint64(2), got.Seq)
 }
 
+// TestDebitLog_TornThenRestartAppendRestart_NoSeqReuse is the regression for the
+// must-fix: a torn fragment must be TRUNCATED on load, not merely skipped, or the
+// next Append merges onto it and a SECOND restart loses events + reuses a Seq.
+// Exercises torn -> restart -> append -> restart and asserts Seq never regresses.
+func TestDebitLog_TornThenRestartAppendRestart_NoSeqReuse(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "debits.jsonl")
+
+	// crash state: two good records + a torn (no-newline) fragment
+	good1, err := json.Marshal(func() DebitEvent { e := sampleEvent("r1"); e.Seq = 1; return e }())
+	require.NoError(t, err)
+	good2, err := json.Marshal(func() DebitEvent { e := sampleEvent("r2"); e.Seq = 2; return e }())
+	require.NoError(t, err)
+	content := append(append(good1, '\n'), append(append(good2, '\n'), []byte(`{"request_id":"r3","seq":3,"inp`)...)...)
+	require.NoError(t, os.WriteFile(path, content, 0o600))
+
+	// restart #1: load truncates the torn frag; append r3 cleanly at seq 3
+	dl1 := newDebitLog(path, testLogger)
+	require.Equal(t, uint64(2), dl1.highWater())
+	got, err := dl1.Append(sampleEvent("r3"))
+	require.NoError(t, err)
+	require.Equal(t, uint64(3), got.Seq)
+	require.NoError(t, dl1.close())
+
+	// restart #2: r3 must survive as its OWN line (not merged onto the frag),
+	// highWater stays 3, and the next Seq is 4 — never a reuse of 3.
+	dl2 := newDebitLog(path, testLogger)
+	defer dl2.close()
+	assert.Equal(t, uint64(3), dl2.highWater(), "seq must not regress after torn-then-append")
+	all := dl2.Since(0)
+	require.Len(t, all, 3)
+	assert.Equal(t, []uint64{1, 2, 3}, []uint64{all[0].Seq, all[1].Seq, all[2].Seq})
+	assert.Equal(t, "r3", all[2].RequestID)
+
+	got2, err := dl2.Append(sampleEvent("r4"))
+	require.NoError(t, err)
+	assert.Equal(t, uint64(4), got2.Seq, "next seq continues at 4 — no reuse")
+}
+
+// TestDebitLog_EnabledFalseAfterClose: enabled() agrees with Append after close.
+func TestDebitLog_EnabledFalseAfterClose(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "debits.jsonl")
+	dl := newDebitLog(path, testLogger)
+	require.True(t, dl.enabled())
+	require.NoError(t, dl.close())
+	assert.False(t, dl.enabled(), "closed log reports disabled")
+	got, err := dl.Append(sampleEvent("rx"))
+	assert.NoError(t, err)
+	assert.Zero(t, got.Seq, "closed log no-ops Append (consistent with enabled()=false)")
+}
+
 // TestDebitLog_SinceReturnsIndependentCopy: mutating the returned slice must not
 // corrupt the live log.
 func TestDebitLog_SinceReturnsIndependentCopy(t *testing.T) {
