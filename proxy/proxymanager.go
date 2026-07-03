@@ -890,9 +890,16 @@ func (pm *ProxyManager) proxyInferenceHandler(c *gin.Context) {
 	isStreaming := gjson.GetBytes(bodyBytes, "stream").Bool()
 	ctx := context.WithValue(c.Request.Context(), proxyCtxKey("streaming"), isStreaming)
 	ctx = context.WithValue(ctx, proxyCtxKey("model"), modelID)
-	ctx = context.WithValue(ctx, proxyCtxKey("client"), c.GetString("client"))   // usage attribution
-	ctx = context.WithValue(ctx, proxyCtxKey("country"), c.GetString("country")) // geo attribution
-	ctx = context.WithValue(ctx, proxyCtxKey("ip"), c.GetString("ip"))           // source IP
+	ctx = context.WithValue(ctx, proxyCtxKey("client"), c.GetString("client"))                   // usage attribution
+	ctx = context.WithValue(ctx, proxyCtxKey("country"), c.GetString("country"))                 // geo attribution
+	ctx = context.WithValue(ctx, proxyCtxKey("ip"), c.GetString("ip"))                           // source IP
+	ctx = context.WithValue(ctx, proxyCtxKey("key_fingerprint"), c.GetString("key_fingerprint")) // billing join key
+	// Per-request slot the peer dispatch fills with the serving node (debit-log
+	// COGS). A *string so the value written mid-dispatch is visible when metrics
+	// are recorded after the response completes. Always installed (cheap); read
+	// only when debit logging is enabled.
+	servedBy := new(string)
+	ctx = context.WithValue(ctx, proxyCtxKey("servedBy"), servedBy)
 	c.Request = c.Request.WithContext(ctx)
 
 	if pm.metricsMonitor != nil && c.Request.Method == "POST" && shouldCollectMetrics(c.Request.URL.Path) {
@@ -1140,6 +1147,7 @@ func (pm *ProxyManager) apiKeyAuth() gin.HandlerFunc {
 			label = fp
 		}
 		c.Set("client", label)
+		c.Set("key_fingerprint", fp) // per-key billing join key (debit log); never the raw key
 		// Country + source IP come from Cloudflare's edge (Cf-IPCountry /
 		// Cf-Connecting-Ip) when via the tunnel; fall back to gin's ClientIP for
 		// LAN/direct requests.

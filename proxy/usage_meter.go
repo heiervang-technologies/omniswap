@@ -74,6 +74,13 @@ func ipFromContext(r *http.Request) string {
 	return ctxStr(r, "ip")
 }
 
+// keyFingerprintFromContext reads the auth'd key's sha256[:12] fingerprint that
+// apiKeyAuth stashes — the per-key billing join key for the debit log (never the
+// raw key). Empty for unauth'd / non-inference paths.
+func keyFingerprintFromContext(r *http.Request) string {
+	return ctxStr(r, "key_fingerprint")
+}
+
 func ctxStr(r *http.Request, key string) string {
 	if r == nil {
 		return ""
@@ -82,6 +89,31 @@ func ctxStr(r *http.Request, key string) string {
 		return v
 	}
 	return ""
+}
+
+// nodeFromContext reads which peer/node served the request, from the per-request
+// *string slot the dispatch writes via setServedBy. Empty when unset (no peer
+// path, or the slot wasn't installed). Used for debit-log COGS attribution.
+func nodeFromContext(r *http.Request) string {
+	if r == nil {
+		return ""
+	}
+	if p, ok := r.Context().Value(proxyCtxKey("servedBy")).(*string); ok && p != nil {
+		return *p
+	}
+	return ""
+}
+
+// setServedBy records the serving node into the per-request slot nodeFromContext
+// reads. Nil-safe and slot-optional: a request without the slot (the default,
+// when debit logging is off) is a silent no-op, so this never affects routing.
+func setServedBy(r *http.Request, node string) {
+	if r == nil {
+		return
+	}
+	if p, ok := r.Context().Value(proxyCtxKey("servedBy")).(*string); ok && p != nil {
+		*p = node
+	}
 }
 
 // usage_meter.go — per-client token-usage analytics for the auth'd pool.
