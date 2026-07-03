@@ -58,6 +58,11 @@ type PeerProxy struct {
 	// on overflow). Disabled by default (see peer_admission.go); enabled at startup
 	// via setAdmission when the operator sets maxInflightPerPeer.
 	admission *peerAdmission
+
+	// scheduler is the serverless eligibility Ranker (cloud RFC #176/#177, stage
+	// 1; see scheduler.go). Constructed but INERT — not wired into selection yet;
+	// exposed via SchedulerRanker() for the stage-3 scheduler control-loop.
+	scheduler *GemsRanker
 }
 
 func NewPeerProxy(peers config.PeerDictionaryConfig, proxyLogger *LogMonitor) (*PeerProxy, error) {
@@ -149,7 +154,7 @@ func NewPeerProxy(peers config.PeerDictionaryConfig, proxyLogger *LogMonitor) (*
 		}
 	}
 
-	return &PeerProxy{
+	p := &PeerProxy{
 		peers:        peers,
 		modelPeers:   modelPeers,
 		memberByPeer: memberByPeer,
@@ -176,7 +181,11 @@ func NewPeerProxy(peers config.PeerDictionaryConfig, proxyLogger *LogMonitor) (*
 		// Admission disabled by default (land-dark); setAdmission enables it from
 		// the operator config after construction, before any request is served.
 		admission: newPeerAdmission(0, 0, peerIDs),
-	}, nil
+	}
+	// Serverless eligibility ranker — constructed but INERT (not in the selection
+	// path). Available to the stage-3 scheduler control-loop via SchedulerRanker().
+	p.scheduler = NewGemsRanker(p)
+	return p, nil
 }
 
 // setAdmission enables (or replaces) per-peer in-flight admission control. Called
@@ -280,6 +289,39 @@ func (p *PeerProxy) ProxyRequest(model_id string, writer http.ResponseWriter, re
 	return p.admitAndServe(pp, writer, request)
 }
 
+// peerModelBias is the loaded-state routing bias for one peer serving modelID,
+// read lock-free from the short-TTL loadedCache:
+//
+//	0  warm       — model resident here (no cold load)
+//	1  vacant      — nothing loaded (cold-load onto a free GPU)
+//	3  occupied    — a different model is resident (cold-load needs an evict)
+//	6  unreachable — /v1/models poll failing or stale; deprioritize hard so
+//	                 load-aware routing doesn't dispatch to a dead peer and 502
+//	                 it (a peer that died while warm otherwise keeps bias 0 and
+//	                 attracts all its traffic). Only picked if EVERY candidate is
+//	                 dead.
+//
+// Shared by pickPeerForModel and the serverless GemsRanker so both rank off ONE
+// definition of the bias (no drift). Computed outside selectMu — a cache miss
+// never stalls the rank-and-reserve critical section.
+func (p *PeerProxy) peerModelBias(modelID string, pp *peerProxyMember) int64 {
+	loaded := p.peerLoaded(pp.peerID, p.peers[pp.peerID])
+	switch {
+	case len(loaded.served) == 0 || time.Since(loaded.fetchedAt) > 2*p.loadedTTL:
+		return 6
+	case loaded.all[modelID]:
+		return 0
+	case len(loaded.order) == 0:
+		return 1
+	default:
+		return 3
+	}
+}
+
+// SchedulerRanker returns the serverless eligibility Ranker (stage 1, INERT —
+// not in the selection path; see scheduler.go). For the stage-3 control-loop.
+func (p *PeerProxy) SchedulerRanker() Ranker { return p.scheduler }
+
 // pickPeerForModel selects which peer serves modelID among all peers that list
 // it, and RESERVES it (increments inFlight) so the caller must release with a
 // matching decrement. One candidate -> return it. Several -> rank by
@@ -309,23 +351,7 @@ func (p *PeerProxy) pickPeerForModel(modelID string) *peerProxyMember {
 
 	bias := make([]int64, len(candidates))
 	for i, pp := range candidates {
-		loaded := p.peerLoaded(pp.peerID, p.peers[pp.peerID])
-		switch {
-		case len(loaded.served) == 0 || time.Since(loaded.fetchedAt) > 2*p.loadedTTL:
-			// Peer is unreachable: its /v1/models poll is failing (empty served,
-			// or the snapshot is stale because peerLoaded keeps returning the
-			// last-good one past TTL on repeated fetch errors). Deprioritize hard
-			// so load-aware routing doesn't dispatch inference to a dead peer and
-			// 502 it — a peer that died while warm otherwise keeps bias 0 and
-			// attracts all its traffic. Only picked if EVERY candidate is dead.
-			bias[i] = 6
-		case loaded.all[modelID]: // model resident here -> warm, no cold load
-			bias[i] = 0
-		case len(loaded.order) == 0: // nothing loaded -> cold-load onto a free GPU
-			bias[i] = 1
-		default: // a different model is resident -> cold-load needs an evict
-			bias[i] = 3
-		}
+		bias[i] = p.peerModelBias(modelID, pp)
 	}
 
 	p.selectMu.Lock()
