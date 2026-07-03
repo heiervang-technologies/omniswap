@@ -22,11 +22,9 @@ type TokenMetrics struct {
 	ID              int       `json:"id"`
 	Timestamp       time.Time `json:"timestamp"`
 	Model           string    `json:"model"`
-	Client          string    `json:"client"`          // usage-attribution label (set from the auth'd key)
-	Country         string    `json:"country"`         // ISO country from Cf-IPCountry ("local" for LAN)
-	IP              string    `json:"ip"`              // source IP (Cf-Connecting-Ip / ClientIP)
-	KeyFingerprint  string    `json:"key_fingerprint"` // sha256[:12] of the auth'd key — per-key billing join (debit log)
-	Node            string    `json:"node"`            // serving peer/node id — COGS attribution (debit log)
+	Client          string    `json:"client"`  // usage-attribution label (set from the auth'd key)
+	Country         string    `json:"country"` // ISO country from Cf-IPCountry ("local" for LAN)
+	IP              string    `json:"ip"`      // source IP (Cf-Connecting-Ip / ClientIP)
 	CachedTokens    int       `json:"cache_tokens"`
 	InputTokens     int       `json:"input_tokens"`
 	OutputTokens    int       `json:"output_tokens"`
@@ -129,14 +127,12 @@ func (mp *metricsMonitor) wrapHandler(
 
 	// Initialize default metrics - these will always be recorded
 	tm := TokenMetrics{
-		Timestamp:      time.Now(),
-		Model:          modelID,
-		Client:         clientFromContext(request),
-		Country:        countryFromContext(request),
-		IP:             ipFromContext(request),
-		KeyFingerprint: keyFingerprintFromContext(request),
-		Node:           nodeFromContext(request),
-		DurationMs:     int(time.Since(recorder.StartTime()).Milliseconds()),
+		Timestamp:  time.Now(),
+		Model:      modelID,
+		Client:     clientFromContext(request),
+		Country:    countryFromContext(request),
+		IP:         ipFromContext(request),
+		DurationMs: int(time.Since(recorder.StartTime()).Milliseconds()),
 	}
 
 	body := recorder.body.Bytes()
@@ -185,8 +181,6 @@ func (mp *metricsMonitor) wrapHandler(
 	tm.Client = clientFromContext(request)
 	tm.Country = countryFromContext(request)
 	tm.IP = ipFromContext(request)
-	tm.KeyFingerprint = keyFingerprintFromContext(request)
-	tm.Node = nodeFromContext(request)
 	mp.addMetrics(tm)
 	return nil
 }

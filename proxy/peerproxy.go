@@ -275,7 +275,6 @@ func (p *PeerProxy) ProxyRequest(model_id string, writer http.ResponseWriter, re
 	if pp == nil {
 		return fmt.Errorf("no peer proxy found for model %s", model_id)
 	}
-	setServedBy(request, pp.peerID) // record the serving node for debit-log COGS (no-op unless enabled)
 
 	// Inject API key if configured for this peer
 	if pp.apiKey != "" {
@@ -379,7 +378,6 @@ func (p *PeerProxy) ProxyRequestToPeer(peerID, modelID string, writer http.Respo
 	if !found {
 		return fmt.Errorf("no peer proxy found for node %s", peerID)
 	}
-	setServedBy(request, peerID) // record the serving node for debit-log COGS (no-op unless enabled)
 
 	if pp.apiKey != "" {
 		request.Header.Set("Authorization", "Bearer "+pp.apiKey)
