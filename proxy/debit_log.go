@@ -142,10 +142,14 @@ func (dl *debitLog) Append(ev DebitEvent) (DebitEvent, error) {
 	return ev, nil
 }
 
-// Since returns a COPY of every event with Seq > cursor, in Seq order — the
-// home-pull payload. cursor 0 returns the whole log. The copy is independent of
-// the live slice so the caller can marshal it without holding the lock.
-func (dl *debitLog) Since(cursor uint64) []DebitEvent {
+// SinceWithHead returns a COPY of every event with Seq > cursor AND the current
+// head Seq (high-water), captured under ONE lock. Atomicity is load-bearing for
+// the pull: reading the events and the head under SEPARATE locks would let an
+// async Append land between them (events up to N, head N+1), and a puller that
+// advances its cursor to head would then skip seq N+1 forever — a silent
+// under-bill (the event stays durable but is never pulled). Returning both from
+// one snapshot guarantees `events` covers everything up to `head`.
+func (dl *debitLog) SinceWithHead(cursor uint64) ([]DebitEvent, uint64) {
 	dl.mu.Lock()
 	defer dl.mu.Unlock()
 	var out []DebitEvent
@@ -154,11 +158,19 @@ func (dl *debitLog) Since(cursor uint64) []DebitEvent {
 			out = append(out, ev)
 		}
 	}
-	return out
+	return out, dl.seq
+}
+
+// Since returns a COPY of every event with Seq > cursor, in Seq order (cursor 0
+// = the whole log). The copy is independent of the live slice. Prefer
+// SinceWithHead for the pull, where events + head must be one atomic snapshot.
+func (dl *debitLog) Since(cursor uint64) []DebitEvent {
+	events, _ := dl.SinceWithHead(cursor)
+	return events
 }
 
 // highWater returns the highest Seq assigned so far (0 if empty) — the head of
-// the log, for observability and the pull's "you are caught up" signal.
+// the log. For the pull use SinceWithHead so events + head can't skew.
 func (dl *debitLog) highWater() uint64 {
 	dl.mu.Lock()
 	defer dl.mu.Unlock()

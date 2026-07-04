@@ -501,11 +501,23 @@ func (pm *ProxyManager) debitsPullHandler(c *gin.Context) {
 			since = v
 		}
 	}
-	c.JSON(http.StatusOK, gin.H{
+	// events + head from ONE snapshot so `events` always covers up to high_water
+	// (else an async append between two reads would strand seq N+1 forever).
+	events, head := pm.debitLog.SinceWithHead(since)
+	resp := gin.H{
 		"enabled":    true,
-		"events":     pm.debitLog.Since(since),
-		"high_water": pm.debitLog.highWater(),
-	})
+		"events":     events,
+		"high_water": head,
+	}
+	// Surface the emitter's shed/failure counters so an under-bill is observable
+	// on the money rail (a full-buffer drop or a disk-error skip never reaches the
+	// log, so the puller can't see it in events — only here).
+	if pm.debitEmitter != nil {
+		resp["dropped"] = pm.debitEmitter.droppedCount()
+		resp["failed"] = pm.debitEmitter.failedCount()
+		resp["appended"] = pm.debitEmitter.appendedCount()
+	}
+	c.JSON(http.StatusOK, resp)
 }
 
 // Shutdown stops all processes managed by this ProxyManager
