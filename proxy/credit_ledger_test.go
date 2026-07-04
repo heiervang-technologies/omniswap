@@ -13,7 +13,7 @@ import (
 // deny anything that would overspend.
 func TestCreditLedger_ReserveWithinBalance_DeniesOver(t *testing.T) {
 	l := newCreditLedger()
-	l.SetAllowance("k", 100, 0)
+	l.SetAllowance("k", 100, 0, 1)
 
 	r1, ok := l.Reserve("k", 60)
 	require.True(t, ok)
@@ -42,7 +42,7 @@ func TestCreditLedger_UnknownKeyDeniesAll(t *testing.T) {
 // is a no-op if called twice.
 func TestCreditLedger_ReleaseRestores_Idempotent(t *testing.T) {
 	l := newCreditLedger()
-	l.SetAllowance("k", 100, 0)
+	l.SetAllowance("k", 100, 0, 1)
 	r, _ := l.Reserve("k", 60)
 	assert.Equal(t, int64(40), l.Available("k"))
 
@@ -56,7 +56,7 @@ func TestCreditLedger_ReleaseRestores_Idempotent(t *testing.T) {
 // reservation), releases the rest, and is idempotent.
 func TestCreditLedger_TrueUp(t *testing.T) {
 	l := newCreditLedger()
-	l.SetAllowance("k", 100, 0)
+	l.SetAllowance("k", 100, 0, 1)
 
 	r, _ := l.Reserve("k", 60) // reserve worst-case 60
 	assert.True(t, r.TrueUp(25), "first true-up records the debit")
@@ -74,7 +74,7 @@ func TestCreditLedger_TrueUp(t *testing.T) {
 // fires first wins; the other no-ops (the leak-proof idempotency guarantee).
 func TestCreditLedger_ReleaseAfterTrueUp_NoDoubleCount(t *testing.T) {
 	l := newCreditLedger()
-	l.SetAllowance("k", 100, 0)
+	l.SetAllowance("k", 100, 0, 1)
 	r, _ := l.Reserve("k", 40)
 	require.True(t, r.TrueUp(30))
 	r.Release() // must NOT return the already-billed hold
@@ -85,7 +85,7 @@ func TestCreditLedger_ReleaseAfterTrueUp_NoDoubleCount(t *testing.T) {
 // a snapshot nets it (SetAllowance ages it out) — available stays consistent.
 func TestCreditLedger_ConfirmAndAgeOut(t *testing.T) {
 	l := newCreditLedger()
-	l.SetAllowance("k", 100, 0)
+	l.SetAllowance("k", 100, 0, 1)
 	r, _ := l.Reserve("k", 60)
 	r.TrueUp(25)
 	assert.Equal(t, int64(75), l.Available("k")) // pending 25
@@ -94,7 +94,7 @@ func TestCreditLedger_ConfirmAndAgeOut(t *testing.T) {
 	assert.Equal(t, int64(75), l.Available("k"), "confirm is available-neutral")
 
 	// home nets the debit: new balance 75 (was 100, minus the 25 consumed) @ watermark 5
-	l.SetAllowance("k", 75, 5)
+	l.SetAllowance("k", 75, 5, 2)
 	assert.Equal(t, int64(75), l.Available("k"), "age-out is available-neutral: balance dropped by exactly the aged debit")
 }
 
@@ -102,7 +102,7 @@ func TestCreditLedger_ConfirmAndAgeOut(t *testing.T) {
 // allowance is not double-counted.
 func TestCreditLedger_ConfirmBelowWatermarkDropped(t *testing.T) {
 	l := newCreditLedger()
-	l.SetAllowance("k", 100, 10) // watermark already at 10
+	l.SetAllowance("k", 100, 10, 1) // watermark already at 10
 	r, _ := l.Reserve("k", 20)
 	r.TrueUp(5)
 	assert.Equal(t, int64(95), l.Available("k")) // pending 5
@@ -117,7 +117,7 @@ func TestCreditLedger_ConfirmBelowWatermarkDropped(t *testing.T) {
 func TestCreditLedger_ConcurrentReserve_ExactlyCapSucceed(t *testing.T) {
 	l := newCreditLedger()
 	const cost, capacity = 10, 7
-	l.SetAllowance("k", cost*capacity, 0)
+	l.SetAllowance("k", cost*capacity, 0, 1)
 
 	var ok int64
 	var wg sync.WaitGroup
@@ -139,7 +139,7 @@ func TestCreditLedger_ConcurrentReserve_ExactlyCapSucceed(t *testing.T) {
 // the SAME reservation resolve it exactly once (never double-count).
 func TestCreditLedger_ConcurrentResolveSameReservation(t *testing.T) {
 	l := newCreditLedger()
-	l.SetAllowance("k", 100, 0)
+	l.SetAllowance("k", 100, 0, 1)
 	r, _ := l.Reserve("k", 60)
 
 	var wg sync.WaitGroup
@@ -152,4 +152,39 @@ func TestCreditLedger_ConcurrentResolveSameReservation(t *testing.T) {
 	// (avail 70). Never 130 (double release) or 40 (double count).
 	avail := l.Available("k")
 	assert.Contains(t, []int64{100, 70}, avail, "resolved exactly once, no double-count")
+}
+
+// TestCreditLedger_ConfirmIdempotent: the confirm path is at-least-once (cursor
+// replay on restart), so a replayed Confirm of the same seq must be a no-op —
+// else confirmedSum inflates permanently (phantom credit loss). big-dog #30 fix.
+func TestCreditLedger_ConfirmIdempotent(t *testing.T) {
+	l := newCreditLedger()
+	l.SetAllowance("k", 100, 0, 1)
+	r, _ := l.Reserve("k", 60)
+	r.TrueUp(25)
+
+	l.Confirm("k", 25, 5)
+	assert.Equal(t, int64(75), l.Available("k"))
+	l.Confirm("k", 25, 5) // REPLAY — must be a no-op, not a phantom -25
+	assert.Equal(t, int64(75), l.Available("k"), "replayed Confirm of the same seq is a no-op")
+
+	// and the dedupe survives age-out (the exact permanent-corruption case)
+	l.SetAllowance("k", 75, 5, 2)
+	l.Confirm("k", 25, 5) // replay after the debit was aged out
+	assert.Equal(t, int64(75), l.Available("k"), "replay after age-out stays consistent, no stuck confirmedSum")
+}
+
+// TestCreditLedger_SetAllowance_IgnoresStaleSnapshot: the money core must not let
+// a stale/out-of-order snapshot with a HIGHER balance inflate available (which
+// would permit over-spend). big-dog #30 fix.
+func TestCreditLedger_SetAllowance_IgnoresStaleSnapshot(t *testing.T) {
+	l := newCreditLedger()
+	l.SetAllowance("k", 40, 0, 5) // current: balance 40 @ ver 5
+	assert.Equal(t, int64(40), l.Available("k"))
+
+	l.SetAllowance("k", 100, 0, 3) // STALE (ver 3 < 5) carrying a HIGHER balance
+	assert.Equal(t, int64(40), l.Available("k"), "a stale snapshot can't inflate the balance — over-spend guard")
+
+	l.SetAllowance("k", 90, 0, 6) // fresh (ver 6 > 5) applies
+	assert.Equal(t, int64(90), l.Available("k"))
 }

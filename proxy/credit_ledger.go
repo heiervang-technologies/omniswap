@@ -38,12 +38,14 @@ type creditLedger struct {
 }
 
 type keyCredit struct {
-	allowance    int64
-	ackWatermark uint64
-	confirmed    map[uint64]int64 // seq -> cost, only for seq > ackWatermark
-	confirmedSum int64
-	pending      int64
-	reserved     int64
+	allowance     int64
+	allowanceVer  uint64           // monotonic snapshot version; a stale/out-of-order push is ignored
+	ackWatermark  uint64           // debits with seq <= this are already netted into `allowance`
+	confirmed     map[uint64]int64 // seq -> cost, only for seq > ackWatermark
+	confirmedSum  int64
+	confirmedHigh uint64 // highest seq ever Confirmed; dedupes at-least-once Confirm replays
+	pending       int64
+	reserved      int64
 }
 
 func newCreditLedger() *creditLedger {
@@ -140,6 +142,15 @@ func (r *Reservation) TrueUp(actual int64) bool {
 // age it out. If seq <= ackWatermark a snapshot already accounts for it, so it is
 // only removed from pending (never double-counted). Available-neutral for the
 // seq > watermark case.
+//
+// IDEMPOTENT per seq: the confirm path is at-least-once (a cursor replay on
+// restart re-confirms a seq, same reason the debit log carries request_id +
+// ON CONFLICT). Confirms arrive in monotonic seq order (the log's single writer
+// assigns seq sequentially), so a seq <= confirmedHigh is a replay and a no-op —
+// guarding BOTH the pending decrement and the confirmedSum add, else a replay
+// would phantom-drop pending and permanently inflate confirmedSum. An out-of-
+// order seq is also skipped, which errs customer-favourable (a transient
+// under-count, never over-count / over-spend).
 func (l *creditLedger) Confirm(key string, cost int64, seq uint64) {
 	if cost <= 0 {
 		return
@@ -147,6 +158,10 @@ func (l *creditLedger) Confirm(key string, cost int64, seq uint64) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	k := l.keyLocked(key)
+	if seq <= k.confirmedHigh {
+		return // already confirmed this seq (replay) — no-op
+	}
+	k.confirmedHigh = seq
 	if k.pending >= cost {
 		k.pending -= cost
 	} else {
@@ -159,15 +174,24 @@ func (l *creditLedger) Confirm(key string, cost int64, seq uint64) {
 }
 
 // SetAllowance applies a pushed snapshot: `balance` (already nets debits with
-// seq <= watermark) and the ack `watermark`. It ages out confirmed debits at or
-// below the watermark — now reflected in `balance` — so they aren't double
-// counted. available stays consistent because `balance` dropped by exactly the
-// aged debits' cost. A watermark that doesn't advance leaves the confirmed set
-// intact (idempotent re-push).
-func (l *creditLedger) SetAllowance(key string, balance int64, watermark uint64) {
+// seq <= watermark), the ack `watermark`, and the snapshot's monotonic `ver`.
+// It ages out confirmed debits at or below the watermark — now reflected in
+// `balance` — so they aren't double counted. available stays consistent because
+// `balance` dropped by exactly the aged debits' cost.
+//
+// The ledger is the last line before money moves, so a STALE / out-of-order
+// snapshot is IGNORED: `ver` is monotonic per key and a `ver < allowanceVer`
+// push is dropped. Without this, an old snapshot carrying a HIGHER balance would
+// overstate available and permit over-spend. (A same-or-newer ver re-applies;
+// the watermark stays independently monotonic-guarded.)
+func (l *creditLedger) SetAllowance(key string, balance int64, watermark uint64, ver uint64) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	k := l.keyLocked(key)
+	if ver < k.allowanceVer {
+		return // stale / out-of-order snapshot — never inflate the money core
+	}
+	k.allowanceVer = ver
 	k.allowance = balance
 	if watermark > k.ackWatermark {
 		for seq, cost := range k.confirmed {
