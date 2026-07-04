@@ -172,6 +172,7 @@ func TestCreditLedger_ConfirmIdempotent(t *testing.T) {
 	l.SetAllowance("k", 75, 5, 2)
 	l.Confirm("k", 25, 5) // replay after the debit was aged out
 	assert.Equal(t, int64(75), l.Available("k"), "replay after age-out stays consistent, no stuck confirmedSum")
+	assert.Equal(t, int64(2), l.confirmSkips(), "both replays counted as skips")
 }
 
 // TestCreditLedger_SetAllowance_IgnoresStaleSnapshot: the money core must not let

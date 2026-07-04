@@ -33,8 +33,9 @@ import "sync"
 // a leaked/double resolution can't corrupt the balance.
 
 type creditLedger struct {
-	mu   sync.Mutex
-	keys map[string]*keyCredit
+	mu    sync.Mutex
+	keys  map[string]*keyCredit
+	skips int64 // Confirm no-ops (seq<=confirmedHigh); see Confirm — steady-state nonzero = ordering violation
 }
 
 type keyCredit struct {
@@ -143,14 +144,24 @@ func (r *Reservation) TrueUp(actual int64) bool {
 // only removed from pending (never double-counted). Available-neutral for the
 // seq > watermark case.
 //
-// IDEMPOTENT per seq: the confirm path is at-least-once (a cursor replay on
-// restart re-confirms a seq, same reason the debit log carries request_id +
-// ON CONFLICT). Confirms arrive in monotonic seq order (the log's single writer
-// assigns seq sequentially), so a seq <= confirmedHigh is a replay and a no-op —
-// guarding BOTH the pending decrement and the confirmedSum add, else a replay
-// would phantom-drop pending and permanently inflate confirmedSum. An out-of-
-// order seq is also skipped, which errs customer-favourable (a transient
-// under-count, never over-count / over-spend).
+// IDEMPOTENT per seq via confirmedHigh: the confirm path is at-least-once (a
+// restart/cursor replay re-reads the log tail). A replay re-reads seqs in
+// INCREASING order, so a seq <= confirmedHigh no-ops the whole replayed run in
+// O(1) — including replays of already-aged seqs that a watermark-pruned per-seq
+// set could not catch. Guards BOTH the pending decrement and the confirmedSum
+// add, else a replay would phantom-drop pending and permanently inflate
+// confirmedSum.
+//
+// IN-ORDER CONFIRM IS A CORRECTNESS REQUIREMENT, NOT A PERFORMANCE NICETY. If
+// Confirm(6) ran before Confirm(5), confirmedHigh would jump to 6 and Confirm(5)
+// would be skipped as a "replay" — but cost5 is a NEW debit that is then never
+// moved out of pending, and nothing ever clears it (SetAllowance doesn't touch
+// pending), so available stays understated by cost5 PERMANENTLY. So Confirm MUST
+// be driven single-threaded in log/append order (the single writer, or one
+// single-threaded tailer) — NEVER goroutine-per-event, never a parallel batch.
+// The 2b.3 gate wiring asserts this at the call site. `skips` counts the no-ops:
+// a nonzero rate OUTSIDE a restart replay flags an ordering violation that would
+// silently eat credits.
 func (l *creditLedger) Confirm(key string, cost int64, seq uint64) {
 	if cost <= 0 {
 		return
@@ -159,6 +170,7 @@ func (l *creditLedger) Confirm(key string, cost int64, seq uint64) {
 	defer l.mu.Unlock()
 	k := l.keyLocked(key)
 	if seq <= k.confirmedHigh {
+		l.skips++
 		return // already confirmed this seq (replay) — no-op
 	}
 	k.confirmedHigh = seq
@@ -210,4 +222,13 @@ func (l *creditLedger) Available(key string) int64 {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	return l.keyLocked(key).available()
+}
+
+// confirmSkips is the count of Confirm no-ops (replayed/out-of-order seqs).
+// Expected to spike during a restart replay; a nonzero rate in steady state
+// signals a Confirm ordering violation (see Confirm) that would eat credits.
+func (l *creditLedger) confirmSkips() int64 {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.skips
 }
