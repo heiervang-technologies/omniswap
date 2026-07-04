@@ -43,6 +43,12 @@ type ProxyManager struct {
 	usageMeter     *UsageMeter
 	rateLimiter    *rateLimiter
 
+	// Usage-billing debit pipeline (land-dark: both nil unless DebitLogPath set).
+	// The log is the durable JSONL sink; the emitter keeps its fsync off the
+	// request path. See debit_log.go / debit_emitter.go.
+	debitLog     *debitLog
+	debitEmitter *debitEmitter
+
 	processGroups map[string]*ProcessGroup
 
 	// shutdown signaling
@@ -157,6 +163,15 @@ func New(proxyConfig config.Config) *ProxyManager {
 		peerProxy.setAdmission(proxyConfig.MaxInflightPerPeer, queueTimeout)
 	}
 
+	// Usage-billing debit pipeline — land-dark: the log is disabled (a no-op) and
+	// the emitter is nil unless DebitLogPath is configured, so there is no writer
+	// goroutine and zero request-path cost by default.
+	dLog := newDebitLog(proxyConfig.DebitLogPath, proxyLogger)
+	var dEmitter *debitEmitter
+	if dLog.enabled() {
+		dEmitter = newDebitEmitter(dLog, proxyConfig.DebitLogBufSize, proxyLogger)
+	}
+
 	pm := &ProxyManager{
 		config:    proxyConfig,
 		ginEngine: gin.New(),
@@ -168,6 +183,9 @@ func New(proxyConfig config.Config) *ProxyManager {
 		metricsMonitor: newMetricsMonitor(proxyLogger, maxMetrics),
 		usageMeter:     NewUsageMeter(proxyConfig.UsagePath, proxyLogger),
 		rateLimiter:    newRateLimiter(proxyConfig.RateLimitPerMin, proxyConfig.RateLimitOverrides),
+
+		debitLog:     dLog,
+		debitEmitter: dEmitter,
 
 		processGroups: make(map[string]*ProcessGroup),
 
@@ -181,9 +199,11 @@ func New(proxyConfig config.Config) *ProxyManager {
 		peerProxy: peerProxy,
 	}
 
-	// Feed every recorded token metric into the per-client usage meter.
+	// Feed every recorded token metric into the per-client usage meter + the
+	// (optional) usage-billing debit log.
 	pm.metricsMonitor.onRecord = func(tm TokenMetrics) {
 		pm.usageMeter.Record(tm.Client, tm.Model, tm.Country, tm.IP, tm.InputTokens, tm.OutputTokens)
+		pm.emitDebit(tm)
 	}
 
 	// create the process groups
@@ -333,6 +353,7 @@ func (pm *ProxyManager) setupGinEngine() {
 	// per-client token usage analytics (admin-only)
 	pm.ginEngine.GET("/usage", pm.apiKeyAuth(), pm.usageHandler)
 	pm.ginEngine.POST("/usage/reset", pm.apiKeyAuth(), pm.usageResetHandler)
+	pm.ginEngine.GET("/debits", pm.apiKeyAuth(), pm.debitsPullHandler) // billing pull (admin-only, land-dark unless DebitLogPath set)
 
 	// in proxymanager_loghandlers.go
 	pm.ginEngine.GET("/logs", pm.apiKeyAuth(), pm.sendLogsHandlers)
@@ -434,6 +455,71 @@ func (pm *ProxyManager) StopProcesses(strategy StopStrategy) {
 	wg.Wait()
 }
 
+// emitDebit builds a DebitEvent from a completed request's metrics and hands it
+// to the off-hot-path emitter for durable, finance-pullable billing. A no-op
+// when debit logging is disabled (DebitLogPath unset). request_id is minted here
+// (the finance dedupe key); Seq is assigned by the log on append.
+func (pm *ProxyManager) emitDebit(tm TokenMetrics) {
+	if pm.debitEmitter == nil {
+		return
+	}
+	rid, err := mintRequestID()
+	if err != nil {
+		pm.proxyLogger.Warnf("debit: mint request_id failed, dropping event: %v", err)
+		return
+	}
+	pm.debitEmitter.Emit(DebitEvent{
+		RequestID:      rid,
+		Ts:             tm.Timestamp,
+		KeyFingerprint: tm.KeyFingerprint,
+		ClientLabel:    tm.Client,
+		Model:          tm.Model,
+		InputTokens:    int64(tm.InputTokens),
+		OutputTokens:   int64(tm.OutputTokens),
+		Node:           tm.Node,
+		Country:        tm.Country,
+	})
+}
+
+// debitsPullHandler serves the debit-event log to a HOME-initiated pull (the
+// billing rail; admin-only, like /usage). Query ?since=<seq> returns events with
+// Seq > since (0 = the whole log) plus the current high-water Seq, so the puller
+// advances its cursor across calls. Reports enabled:false + empty when debit
+// logging is off.
+func (pm *ProxyManager) debitsPullHandler(c *gin.Context) {
+	if !pm.usageReaderAllowed(c) {
+		pm.sendErrorResponse(c, http.StatusForbidden, "forbidden: /debits is admin-only")
+		return
+	}
+	if pm.debitLog == nil || !pm.debitLog.enabled() {
+		c.JSON(http.StatusOK, gin.H{"enabled": false, "events": []DebitEvent{}, "high_water": 0})
+		return
+	}
+	var since uint64
+	if s := c.Query("since"); s != "" {
+		if v, perr := strconv.ParseUint(s, 10, 64); perr == nil {
+			since = v
+		}
+	}
+	// events + head from ONE snapshot so `events` always covers up to high_water
+	// (else an async append between two reads would strand seq N+1 forever).
+	events, head := pm.debitLog.SinceWithHead(since)
+	resp := gin.H{
+		"enabled":    true,
+		"events":     events,
+		"high_water": head,
+	}
+	// Surface the emitter's shed/failure counters so an under-bill is observable
+	// on the money rail (a full-buffer drop or a disk-error skip never reaches the
+	// log, so the puller can't see it in events — only here).
+	if pm.debitEmitter != nil {
+		resp["dropped"] = pm.debitEmitter.droppedCount()
+		resp["failed"] = pm.debitEmitter.failedCount()
+		resp["appended"] = pm.debitEmitter.appendedCount()
+	}
+	c.JSON(http.StatusOK, resp)
+}
+
 // Shutdown stops all processes managed by this ProxyManager
 func (pm *ProxyManager) Shutdown() {
 	pm.Lock()
@@ -451,6 +537,16 @@ func (pm *ProxyManager) Shutdown() {
 		}(processGroup)
 	}
 	wg.Wait()
+
+	// Flush + close the debit pipeline so a clean shutdown persists in-flight
+	// billing events (emitter drains, then the log releases its file handle).
+	if pm.debitEmitter != nil {
+		pm.debitEmitter.Close()
+	}
+	if pm.debitLog != nil {
+		_ = pm.debitLog.close()
+	}
+
 	pm.shutdownCancel()
 }
 

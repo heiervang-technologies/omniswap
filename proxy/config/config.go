@@ -183,6 +183,15 @@ type Config struct {
 	// consulted when MaxInflightPerPeer > 0.
 	QueueTimeout string `yaml:"queueTimeout"`
 
+	// DebitLogPath enables the usage-billing debit-event log at this file path.
+	// Empty (the default) DISABLES it entirely (land-dark) — no emit, no writer
+	// goroutine, zero request-path cost. When set, every completed inference
+	// appends one DebitEvent (JSONL, fsync'd) for finance to pull from /debits.
+	DebitLogPath string `yaml:"debitLogPath"`
+	// DebitLogBufSize is the async emitter's channel depth (events buffered before
+	// overflow-drop). 0 picks a sensible default. Only used when DebitLogPath set.
+	DebitLogBufSize int `yaml:"debitLogBufSize"`
+
 	// support remote peers, see issue #433, #296
 	Peers PeerDictionaryConfig `yaml:"peers"`
 }

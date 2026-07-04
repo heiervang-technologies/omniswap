@@ -225,3 +225,30 @@ func TestDebitLog_SinceReturnsIndependentCopy(t *testing.T) {
 	fresh := dl.Since(0)
 	assert.Equal(t, "r1", fresh[0].RequestID, "live log unaffected by caller mutation")
 }
+
+// TestDebitLog_SinceWithHead_Consistent: events + head come from ONE snapshot, so
+// events always reach exactly the reported head (no skew that would strand an
+// event past the puller's advanced cursor).
+func TestDebitLog_SinceWithHead_Consistent(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "debits.jsonl")
+	dl := newDebitLog(path, testLogger)
+	defer dl.close()
+	for _, id := range []string{"r1", "r2", "r3"} {
+		_, err := dl.Append(sampleEvent(id))
+		require.NoError(t, err)
+	}
+
+	events, head := dl.SinceWithHead(0)
+	require.Len(t, events, 3)
+	assert.Equal(t, uint64(3), head)
+	assert.Equal(t, head, events[len(events)-1].Seq, "events reach exactly the reported head — no skew")
+
+	events, head = dl.SinceWithHead(2)
+	require.Len(t, events, 1)
+	assert.Equal(t, uint64(3), events[0].Seq)
+	assert.Equal(t, uint64(3), head)
+
+	events, head = dl.SinceWithHead(3)
+	assert.Empty(t, events, "caught up: no events past the cursor")
+	assert.Equal(t, uint64(3), head, "head still reported")
+}
