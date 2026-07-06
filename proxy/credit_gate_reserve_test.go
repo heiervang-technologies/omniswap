@@ -1,6 +1,7 @@
 package proxy
 
 import (
+	"io"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -18,7 +19,7 @@ func gateWithBalance(enforce bool, key string, balance int64) (*creditGate, *cre
 	prices := newPriceBook(map[string]ModelRate{
 		"m": {InputPer1k: 2, OutputPer1k: 8, MaxOutputTokens: 4096},
 	})
-	return newCreditGate(enforce, ledger, prices, nil), ledger
+	return newCreditGate(enforce, ledger, prices, nil, nil), ledger
 }
 
 const (
@@ -133,7 +134,7 @@ func TestCreditGate_InsufficientDenies(t *testing.T) {
 
 func TestCreditGate_MisconfiguredFailsClosed(t *testing.T) {
 	// enforcing but no price book -> can't price -> fail-closed deny, no panic.
-	g := newCreditGate(true, newCreditLedger(), nil, nil)
+	g := newCreditGate(true, newCreditLedger(), nil, nil, nil)
 	rsv, d := g.admit("k", "m", 1000, 500)
 	assert.Nil(t, rsv)
 	assert.Equal(t, admitUnpriced, d, "enforcing with no price book -> fail-closed")
@@ -161,6 +162,54 @@ func TestCreditGate_ConcurrentAdmitThinBalance(t *testing.T) {
 	assert.Equal(t, int64(n), atomic.LoadInt64(&okCount), "exactly n reserves fit — no oversell across the race")
 	assert.Equal(t, int64(0), ledger.Available("k"), "n holds outstanding -> available exactly 0")
 	assert.GreaterOrEqual(t, ledger.Available("k"), int64(0), "balance never goes negative")
+}
+
+// --- observability: safe-but-wrong true-ups are counted per-model, never silent -
+
+// A true-up whose actual exceeds the reserved hold (backend overshoots max_tokens):
+// the ledger clamps to the hold (bounded under-bill), and the gate COUNTS it
+// per-model (big-dog ask-2) so a mispriced model's leak is visible.
+func TestCreditGate_TrueUpClampIsObservable(t *testing.T) {
+	g, ledger := gateWithBalance(true, "k", 100)
+	// reserve a SMALL completion bound so a large actual completion exceeds it:
+	// ReserveCost("m", 0, 100) = ceil(100*8/1000) = 1.
+	rsv, d := g.admit("k", "m", 0, 100)
+	require.Equal(t, admitOK, d)
+	require.Equal(t, int64(1), rsv.reservedCost)
+
+	rsv.trueUp(0, 500) // ActualCost("m",0,500)=4 > reserved 1 -> clamp
+	assert.Equal(t, int64(1), g.clampCount("m"), "clamp counted per-model")
+	assert.Equal(t, int64(0), g.pricingFailCount("m"))
+	assert.Equal(t, int64(100-1), ledger.Available("k"), "billed the reserved hold (clamped), not the true 4")
+}
+
+// A true-up on a model that lost its price after a successful reserve (the
+// can't-happen pricing-consistency bug): billed 0 (no overcharge) but COUNTED +
+// visible, never a silent free completion.
+func TestCreditGate_TrueUpPricingFailIsObservable(t *testing.T) {
+	g, ledger := gateWithBalance(true, "k", 100)
+	rsv, d := g.admit("k", "m", 1000, 500)
+	require.Equal(t, admitOK, d)
+
+	rsv.model = "vanished-from-book" // white-box: force ActualCost !ok at true-up
+	rsv.trueUp(1000, 250)
+	assert.Equal(t, int64(1), g.pricingFailCount("vanished-from-book"), "pricing anomaly counted per-model")
+	assert.Equal(t, int64(100), ledger.Available("k"), "billed 0 (hold released, no debit) — no overcharge")
+}
+
+// The anomalies WARN (not just count), so a prod violation surfaces in logs.
+func TestCreditGate_ClampWarns(t *testing.T) {
+	ledger := newCreditLedger()
+	ledger.SetAllowance("k", 100, 0, 1)
+	prices := newPriceBook(map[string]ModelRate{"m": {InputPer1k: 2, OutputPer1k: 8, MaxOutputTokens: 4096}})
+	lg := NewLogMonitorWriter(io.Discard)
+	g := newCreditGate(true, ledger, prices, nil, lg)
+
+	rsv, _ := g.admit("k", "m", 0, 100)
+	rsv.trueUp(0, 500) // clamp
+	hist := string(lg.GetHistory())
+	assert.Contains(t, hist, "CLAMP")
+	assert.Contains(t, hist, `"m"`)
 }
 
 // Concurrent admit + resolve churn returns to the seeded balance (every hold
