@@ -218,6 +218,16 @@ type Config struct {
 	// MaxOutputTokens = true-hard-max requirement.
 	CreditRates map[string]CreditRate `yaml:"creditRates"`
 
+	// CreditGateEnforce turns the billing gate ON. Absent/false (the default) =
+	// OFF: the gate is a no-op, the request path is byte-identical, nothing touches
+	// the ledger. Enforcement is DECOUPLED from rate/allowance presence on purpose
+	// (the #352 landmine class, same shape as HOME_POOL_AUTH_ENFORCE): staged
+	// CreditRates + pushed allowances sit INERT until this flag is explicitly set,
+	// so a re-render for any other reason can never flip billing on and start
+	// denying paid traffic. The render tooling emits `creditGateEnforce: true`
+	// ONLY on an explicit opt-in — never derived from data present in the config.
+	CreditGateEnforce bool `yaml:"creditGateEnforce"`
+
 	// support remote peers, see issue #433, #296
 	Peers PeerDictionaryConfig `yaml:"peers"`
 }

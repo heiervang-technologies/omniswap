@@ -51,6 +51,46 @@ models:
 	assert.Empty(t, config.CreditRates)
 }
 
+// TestConfig_CreditGateEnforceDefaultsOff: absent creditGateEnforce => false
+// (OFF). The landmine-proof default — billing enforcement is never on unless
+// explicitly set, decoupled from rate/allowance presence.
+func TestConfig_CreditGateEnforceDefaultsOff(t *testing.T) {
+	content := `
+startPort: 10000
+creditRates:
+  m:
+    inputPer1k: 2
+    outputPer1k: 8
+    maxOutputTokens: 4096
+
+models:
+  test:
+    cmd: echo hi
+    proxy: http://localhost:8080
+`
+	config, err := LoadConfigFromReader(strings.NewReader(content))
+	require.NoError(t, err)
+	assert.False(t, config.CreditGateEnforce, "absent creditGateEnforce defaults OFF even with rates present")
+}
+
+// TestConfig_CreditGateEnforceExplicit: the flag parses true/false when set.
+func TestConfig_CreditGateEnforceExplicit(t *testing.T) {
+	for _, tc := range []struct {
+		val  string
+		want bool
+	}{{"true", true}, {"false", false}} {
+		content := "startPort: 10000\ncreditGateEnforce: " + tc.val + `
+models:
+  test:
+    cmd: echo hi
+    proxy: http://localhost:8080
+`
+		config, err := LoadConfigFromReader(strings.NewReader(content))
+		require.NoError(t, err)
+		assert.Equal(t, tc.want, config.CreditGateEnforce, "creditGateEnforce: %s", tc.val)
+	}
+}
+
 // TestConfig_CreditRatesReject: structurally-broken rates fail to load so a typo
 // can never yield a nonsensical or under-billing price.
 func TestConfig_CreditRatesReject(t *testing.T) {
