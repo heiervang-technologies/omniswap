@@ -261,6 +261,12 @@ func (g *creditGate) guardedAdmit(key, model string, promptTokens, requestedMax 
 // with the handler's `defer release()` — big-dog shape-6 lock 3: recover-to-deny
 // AND hold-released both hold) and the fault is counted. A no-op reservation (gate
 // OFF) has no gate to guard against, so fn (inert) just runs.
+//
+// The compensating release is ITSELF guarded: it touches the same ledger, so when
+// the LEDGER is the fault source, release() panics AGAIN — an unguarded second
+// panic would escape and crash serving + the Ranker (the exact blast-radius event
+// this piece prevents). A hold stranded by a double-faulting ledger is a bounded,
+// observable loss (counted); a crash is not. (big-dog #36)
 func (rsv *creditReservation) guardedResolve(fn func()) {
 	if rsv == nil {
 		return
@@ -270,7 +276,7 @@ func (rsv *creditReservation) guardedResolve(fn func()) {
 		return
 	}
 	if faulted, _ := rsv.gate.recoverGateFault(rsv.model, fn); faulted {
-		rsv.release() // free the hold even though the resolve panicked
+		rsv.gate.recoverGateFault(rsv.model, func() { rsv.release() })
 	}
 }
 

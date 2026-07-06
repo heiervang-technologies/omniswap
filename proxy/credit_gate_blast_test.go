@@ -80,6 +80,27 @@ func TestCreditGate_GuardedResolve_ReleasesAndContainsPanic(t *testing.T) {
 	assert.Equal(t, int64(1), g.gatePanicCount(), "resolve fault counted")
 }
 
+// The double-fault case big-dog flagged: when the LEDGER ITSELF is the fault
+// source, fn (trueUp) panics AND the compensating release() panics AGAIN on the
+// same broken ledger. Both must be contained — nothing escapes to crash serving.
+func TestCreditGate_GuardedResolve_LedgerDoubleFaultContained(t *testing.T) {
+	g, ledger := gateWithBalance(true, "k", 100)
+	rsv, d := g.admit("k", "m", 1000, 500) // real hold taken against a healthy ledger
+	require.Equal(t, admitOK, d)
+
+	// The ledger goes bad AFTER the reserve: nil its map so EVERY further ledger op
+	// panics. Use a resolve fn that panics BEFORE latching the hold's done flag (a
+	// synthetic gate-side fault), so the compensating release genuinely re-runs
+	// against the broken ledger and panics AGAIN — the double-fault big-dog flagged.
+	// (A trueUp/release that reaches the ledger latches done first, which happens to
+	// mask the second panic; the guard must not depend on that.)
+	ledger.keys = nil
+	assert.NotPanics(t, func() {
+		rsv.guardedResolve(func() { panic("gate fault before the hold is resolved") })
+	}, "double-fault (fn panic + compensating release panic on the broken ledger) must be fully contained")
+	assert.Equal(t, int64(2), g.gatePanicCount(), "both the resolve fault and the compensating-release fault are counted")
+}
+
 func TestCreditGate_GuardedResolve_HappyPath(t *testing.T) {
 	g, ledger := gateWithBalance(true, "k", 100)
 	rsv, _ := g.admit("k", "m", 1000, 500)
