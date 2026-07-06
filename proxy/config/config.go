@@ -108,6 +108,25 @@ func (c *GroupConfig) UnmarshalYAML(unmarshal func(interface{}) error) error {
 	return nil
 }
 
+// CreditRate is one model's credit price for the billing gate (cloud
+// project_gems_monetization, stage 2b.3b). DORMANT: parsed + validated here, but
+// nothing enforces it until the gate hook builds a priceBook from these rates.
+//
+// MaxOutputTokens MUST be the model's TRUE hard output ceiling (or slightly
+// above). It is what the gate reserves worst-case against when a request sets no
+// (or an oversized) max_tokens. A ceiling set BELOW the model's real max lets a
+// request generate more tokens than were reserved, so the actual bill exceeds the
+// hold and the ledger clamps it down — a SILENT under-bill. Set it high, never
+// low: over-reserving only briefly holds extra credit (refunded at true-up),
+// under-reserving leaks revenue. LoadConfig rejects a non-positive ceiling
+// outright; a suspiciously-low (but positive) one is warned about at priceBook
+// build time (which has the runtime logger).
+type CreditRate struct {
+	InputPer1k      int64 `yaml:"inputPer1k"`      // credits per 1000 prompt (input) tokens
+	OutputPer1k     int64 `yaml:"outputPer1k"`     // credits per 1000 completion (output) tokens
+	MaxOutputTokens int64 `yaml:"maxOutputTokens"` // model's TRUE hard output max (the worst-case completion)
+}
+
 type HooksConfig struct {
 	OnStartup HookOnStartup `yaml:"on_startup"`
 }
@@ -191,6 +210,13 @@ type Config struct {
 	// DebitLogBufSize is the async emitter's channel depth (events buffered before
 	// overflow-drop). 0 picks a sensible default. Only used when DebitLogPath set.
 	DebitLogBufSize int `yaml:"debitLogBufSize"`
+
+	// CreditRates prices models for the billing gate (stage 2b.3b), keyed by model
+	// ID. Empty (the default) = no model is priced, so the gate — once wired and
+	// enabled — fails CLOSED on every model (it never serves an unpriced model
+	// un-metered). DORMANT until the gate hook consumes it. See CreditRate for the
+	// MaxOutputTokens = true-hard-max requirement.
+	CreditRates map[string]CreditRate `yaml:"creditRates"`
 
 	// support remote peers, see issue #433, #296
 	Peers PeerDictionaryConfig `yaml:"peers"`
@@ -456,6 +482,25 @@ func LoadConfigFromReader(r io.Reader) (Config, error) {
 			return Config{}, fmt.Errorf("api key cannot contain spaces: `%s`", apikey)
 		}
 		config.RequiredAPIKeys[i] = apikey
+	}
+
+	// Validate credit rates (billing gate, dormant). Structurally-broken rates are
+	// rejected here so a typo can never yield a nonsensical or catastrophically
+	// under-billing price: a negative price, or a non-positive output ceiling (the
+	// gate could not reserve any worst-case completion against it). A
+	// suspiciously-LOW but positive ceiling is only WARNED about, at priceBook
+	// build time, since that needs the runtime logger and a tiny-but-legitimate
+	// model is possible.
+	for model, rate := range config.CreditRates {
+		if model == "" {
+			return Config{}, fmt.Errorf("creditRates: empty model key")
+		}
+		if rate.InputPer1k < 0 || rate.OutputPer1k < 0 {
+			return Config{}, fmt.Errorf("creditRates[%s]: negative rate (inputPer1k=%d outputPer1k=%d)", model, rate.InputPer1k, rate.OutputPer1k)
+		}
+		if rate.MaxOutputTokens <= 0 {
+			return Config{}, fmt.Errorf("creditRates[%s]: maxOutputTokens must be > 0 — it is the worst-case completion the gate reserves against, and MUST equal the model's true hard output max (got %d)", model, rate.MaxOutputTokens)
+		}
 	}
 
 	// Process peers with global macro substitution
