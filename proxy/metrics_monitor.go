@@ -122,6 +122,11 @@ func (mp *metricsMonitor) wrapHandler(
 	// after this point we have to assume that data was sent to the client
 	// and we can only log errors but not send them to clients
 
+	// Record the served status for the credit gate's resolve (no-op unless the gate
+	// is enforcing and installed the capture slot). A non-200 here => the gate
+	// refunds; the token counts are filled below on the success path.
+	setCreditCaptureStatus(request, recorder.Status())
+
 	if recorder.Status() != http.StatusOK {
 		mp.logger.Warnf("metrics skipped, HTTP status=%d, path=%s", recorder.Status(), request.URL.Path)
 		return nil
@@ -187,6 +192,10 @@ func (mp *metricsMonitor) wrapHandler(
 	tm.IP = ipFromContext(request)
 	tm.KeyFingerprint = keyFingerprintFromContext(request)
 	tm.Node = nodeFromContext(request)
+	// Feed the metered token counts to the credit gate's resolve (no-op unless the
+	// gate installed the capture slot). Zero here (the minimal-metric paths above:
+	// empty body / no usage block) => the gate bills the reserved estimate, never free.
+	setCreditCaptureTokens(request, tm.InputTokens, tm.OutputTokens)
 	mp.addMetrics(tm)
 	return nil
 }

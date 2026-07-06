@@ -49,6 +49,12 @@ type ProxyManager struct {
 	debitLog     *debitLog
 	debitEmitter *debitEmitter
 
+	// Prepaid-credit billing gate (land-dark: enforce OFF unless CreditGateEnforce is
+	// explicitly set). Reserve@admission + resolve-on-every-exit are wired into
+	// proxyInferenceHandler; OFF => enforcing() is false and that hook is skipped, so
+	// the request path is byte-identical. See credit_gate.go / credit_gate_wiring.go.
+	creditGate *creditGate
+
 	processGroups map[string]*ProcessGroup
 
 	// shutdown signaling
@@ -172,6 +178,21 @@ func New(proxyConfig config.Config) *ProxyManager {
 		dEmitter = newDebitEmitter(dLog, proxyConfig.DebitLogBufSize, proxyLogger)
 	}
 
+	// Prepaid-credit billing gate — constructed always (cheap + inert), but enforce is
+	// OFF unless CreditGateEnforce is EXPLICITLY set (decoupled from rates/allowances
+	// being present — the #352 landmine class). OFF => enforcing() is false, the
+	// handler hook is skipped, request path byte-identical. failOpen (canary
+	// serve-on-fault) defaults false = fail-closed, the safe value.
+	cLedger := newCreditLedger()
+	cGate := newCreditGate(
+		proxyConfig.CreditGateEnforce,
+		cLedger,
+		priceBookFromConfig(proxyConfig.CreditRates, proxyLogger),
+		newAllowanceIngester(cLedger, proxyLogger),
+		proxyLogger,
+	)
+	cGate.failOpen = proxyConfig.CreditGateCanaryFailOpen
+
 	pm := &ProxyManager{
 		config:    proxyConfig,
 		ginEngine: gin.New(),
@@ -186,6 +207,7 @@ func New(proxyConfig config.Config) *ProxyManager {
 
 		debitLog:     dLog,
 		debitEmitter: dEmitter,
+		creditGate:   cGate,
 
 		processGroups: make(map[string]*ProcessGroup),
 
@@ -996,6 +1018,30 @@ func (pm *ProxyManager) proxyInferenceHandler(c *gin.Context) {
 	// only when debit logging is enabled.
 	servedBy := new(string)
 	ctx = context.WithValue(ctx, proxyCtxKey("servedBy"), servedBy)
+
+	// Prepaid-credit billing gate: reserve the worst-case cost at admission and
+	// resolve on EVERY exit. Rides enforcing() the way peer admission rides enabled()
+	// — enforcing() short-circuits first (a cheap bool), so when the gate is OFF (the
+	// default) this whole block is skipped and the request path is byte-identical.
+	// Only meters the same metered inference POSTs the metrics monitor records, so the
+	// captured token counts are always available for the resolve.
+	if pm.creditGate.enforcing() && pm.metricsMonitor != nil && c.Request.Method == "POST" && shouldCollectMetrics(c.Request.URL.Path) {
+		promptUpper := creditPromptUpperBound(bodyBytes)
+		requestedMax := creditRequestedMax(bodyBytes)
+		rsv, decision := pm.creditGate.guardedAdmit(c.GetString("key_fingerprint"), modelID, promptUpper, requestedMax)
+		if !decision.served() {
+			pm.sendErrorResponse(c, creditDenyStatus(decision), creditDenyMessage(decision))
+			return
+		}
+		// Request-scoped capture the metrics monitor fills synchronously before it
+		// returns (like servedBy) — no cross-request correlation. The deferred resolve
+		// bills from THIS request's real outcome, inside the blast-radius boundary so a
+		// gate/ledger fault can't crash serving or the Ranker.
+		cap := &creditCapture{}
+		ctx = contextWithCreditCapture(ctx, cap)
+		defer rsv.guardedResolve(func() { resolveReservation(rsv, cap) })
+	}
+
 	c.Request = c.Request.WithContext(ctx)
 
 	if pm.metricsMonitor != nil && c.Request.Method == "POST" && shouldCollectMetrics(c.Request.URL.Path) {

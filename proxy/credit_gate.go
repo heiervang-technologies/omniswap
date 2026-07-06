@@ -150,6 +150,20 @@ func (rsv *creditReservation) release() {
 	rsv.inner.Release()
 }
 
+// trueUpReserved bills the FULL reserved hold. Used when a request was SERVED (200)
+// but returned no usable usage (backend omitted the usage block / empty body): the
+// completion — the expensive part — can't be measured, so we charge the reserved
+// worst case rather than leak a free completion (big-dog: no-usage -> charge the
+// estimate, never 0/free). The reserve was priced from the prompt upper bound +
+// completion ceiling, so it is the conservative, no-under-bill figure. No-op-safe +
+// idempotent (the ledger's done latch), so it composes with the deferred release.
+func (rsv *creditReservation) trueUpReserved() {
+	if rsv == nil || rsv.inner == nil {
+		return
+	}
+	rsv.inner.TrueUp(rsv.reservedCost)
+}
+
 // anomalyLocked returns model's anomaly counters, creating them on first use.
 // Caller holds g.mu.
 func (g *creditGate) anomalyLocked(model string) *modelAnomaly {
