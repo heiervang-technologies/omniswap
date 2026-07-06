@@ -228,6 +228,13 @@ type Config struct {
 	// ONLY on an explicit opt-in — never derived from data present in the config.
 	CreditGateEnforce bool `yaml:"creditGateEnforce"`
 
+	// CreditGateCanaryFailOpen, when true, makes the gate SERVE (un-metered) on an
+	// internal gate/ledger FAULT (a recovered panic) instead of denying — a
+	// deliberate canary-window opt-in. Default false = fail-CLOSED (a gate fault
+	// denies, containing the blast radius so a gate bug can't gift un-metered
+	// service). Explicit + never derived, like CreditGateEnforce; inert until set.
+	CreditGateCanaryFailOpen bool `yaml:"creditGateCanaryFailOpen"`
+
 	// support remote peers, see issue #433, #296
 	Peers PeerDictionaryConfig `yaml:"peers"`
 }
