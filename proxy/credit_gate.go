@@ -19,9 +19,14 @@ type creditGate struct {
 	prices    *priceBook
 	allowance *allowanceIngester
 	logger    *LogMonitor
+	// failOpen: on a gate/ledger FAULT (recovered panic), serve un-metered instead
+	// of deny. Default false = fail-CLOSED (contain the blast radius). Set from
+	// config.CreditGateCanaryFailOpen by the wiring; the zero value is the safe one.
+	failOpen bool
 
-	mu        sync.Mutex
-	anomalies map[string]*modelAnomaly // per-model billing-anomaly counts (observability; big-dog ask-2)
+	mu         sync.Mutex
+	anomalies  map[string]*modelAnomaly // per-model billing-anomaly counts (observability; big-dog ask-2)
+	gatePanics int64                    // recovered gate/ledger faults (blast-radius); a rising count = the gate is recover-denying, must be VISIBLE not a silent blanket-deny
 }
 
 // modelAnomaly counts the two "safe-but-wrong" true-up cases per model so a
@@ -55,6 +60,7 @@ const (
 	admitOK                                // priced + reserved — served, metered
 	admitUnpriced                          // no price for the model — DENY (fail-closed, never serve un-metered)
 	admitInsufficient                      // priced but balance too low — DENY (402-class)
+	admitFault                             // gate/ledger FAULT (recovered panic) — DENY (fail-closed) unless canary fail-open
 )
 
 // served reports whether the request may proceed (OFF pass-through or a successful
@@ -205,4 +211,100 @@ func (g *creditGate) pricingFailCount(model string) int64 {
 		return a.pricingFails
 	}
 	return 0
+}
+
+// --- blast-radius containment (stage 2b.3c piece 3, big-dog shape 6) ------------
+//
+// The gate shares ONE process (+ GPU) with request serving AND the Ranker
+// model-admission loop, so a gate/ledger fault must NEVER propagate to crash or
+// block those. recoverGateFault is the containment BOUNDARY: it runs a gate call
+// under recover so a panic (or a would-be crash from an internal bug) is caught,
+// counted, WARNed, and turned into a fail-CLOSED deny by default — or, only when
+// the canary fail-open config is explicitly set, a served pass-through. The fault
+// stays inside the gate call; serving and the Ranker are untouched.
+
+// recoverGateFault runs fn under panic containment. On a panic it records the
+// fault (count + WARN) and reports faulted=true with the gate's fail-open policy;
+// on the normal path it returns (false, false). The named returns are set from the
+// deferred recover, so a panic in fn never escapes this call.
+func (g *creditGate) recoverGateFault(model string, fn func()) (faulted bool, failOpen bool) {
+	defer func() {
+		if r := recover(); r != nil {
+			faulted = true
+			failOpen = g.failOpen
+			g.recordGateFault(model, r)
+		}
+	}()
+	fn()
+	return false, false
+}
+
+// guardedAdmit is admit() inside the containment boundary: a gate/ledger fault
+// recovers to a fail-CLOSED admitFault (deny) by default, or — only under the
+// explicit canary fail-open — a served no-op reservation (admitOff, un-metered).
+// The wiring calls THIS, never admit() directly, so a gate bug can't crash serving.
+func (g *creditGate) guardedAdmit(key, model string, promptTokens, requestedMax int64) (rsv *creditReservation, d admitDecision) {
+	faulted, failOpen := g.recoverGateFault(model, func() {
+		rsv, d = g.admit(key, model, promptTokens, requestedMax)
+	})
+	if faulted {
+		if failOpen {
+			return &creditReservation{}, admitOff // canary: serve un-metered (deliberate opt-in)
+		}
+		return nil, admitFault // fail-closed: deny
+	}
+	return rsv, d
+}
+
+// guardedResolve runs a resolve (trueUp or release) inside the containment
+// boundary. If it panics, the hold is STILL released (idempotent, so it composes
+// with the handler's `defer release()` — big-dog shape-6 lock 3: recover-to-deny
+// AND hold-released both hold) and the fault is counted. A no-op reservation (gate
+// OFF) has no gate to guard against, so fn (inert) just runs.
+//
+// The compensating release is ITSELF guarded: it touches the same ledger, so when
+// the LEDGER is the fault source, release() panics AGAIN — an unguarded second
+// panic would escape and crash serving + the Ranker (the exact blast-radius event
+// this piece prevents). A hold stranded by a double-faulting ledger is a bounded,
+// observable loss (counted); a crash is not. (big-dog #36)
+func (rsv *creditReservation) guardedResolve(fn func()) {
+	if rsv == nil {
+		return
+	}
+	if rsv.gate == nil {
+		fn() // OFF no-op reservation — fn is inert
+		return
+	}
+	if faulted, _ := rsv.gate.recoverGateFault(rsv.model, fn); faulted {
+		rsv.gate.recoverGateFault(rsv.model, func() { rsv.release() })
+	}
+}
+
+// recordGateFault counts a recovered gate/ledger fault + WARNs. Global (not
+// per-model): the danger is a gate silently recover-DENYING everything (e.g. the
+// ledger is unreachable), which must look different from a normal fail-closed deny.
+func (g *creditGate) recordGateFault(model string, r any) {
+	g.mu.Lock()
+	g.gatePanics++
+	n := g.gatePanics
+	g.mu.Unlock()
+	if g.logger != nil {
+		g.logger.Warnf("credit gate: FAULT recovered (model %q) — %v; contained to a %s (serving + Ranker unaffected). gatePanics=%d", model, r, g.faultAction(), n)
+	}
+}
+
+func (g *creditGate) faultAction() string {
+	if g.failOpen {
+		return "canary FAIL-OPEN (served un-metered)"
+	}
+	return "fail-CLOSED deny"
+}
+
+// gatePanicCount is the total recovered gate/ledger faults (blast-radius
+// observability). A nonzero-and-climbing value = the gate is faulting, not a
+// healthy fail-closed — page on it, don't mistake it for normal denies.
+func (g *creditGate) gatePanicCount() int64 {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return g.gatePanics
 }
