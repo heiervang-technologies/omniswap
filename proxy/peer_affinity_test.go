@@ -33,12 +33,12 @@ func turn(system, firstUser string, extra ...string) []byte {
 
 func TestAffinityKeyFromBody(t *testing.T) {
 	t.Run("stable as the conversation grows", func(t *testing.T) {
-		k1 := affinityKeyFromBody(turn("you are helpful", "explain rendezvous hashing"))
+		k1 := affinityKeyFromBody(turn("you are helpful", "explain rendezvous hashing"), false)
 		k2 := affinityKeyFromBody(turn("you are helpful", "explain rendezvous hashing",
-			"It maps keys to nodes.", "and what about modulo?"))
+			"It maps keys to nodes.", "and what about modulo?"), false)
 		k3 := affinityKeyFromBody(turn("you are helpful", "explain rendezvous hashing",
 			"It maps keys to nodes.", "and what about modulo?",
-			"Modulo reshuffles everything.", "thanks"))
+			"Modulo reshuffles everything.", "thanks"), false)
 		require.NotEmpty(t, k1)
 		assert.Equal(t, k1, k2, "turn 2 must hash to the conversation's key, not a new one")
 		assert.Equal(t, k1, k3, "turn 3 likewise")
@@ -46,8 +46,8 @@ func TestAffinityKeyFromBody(t *testing.T) {
 
 	t.Run("different opener is a different conversation", func(t *testing.T) {
 		assert.NotEqual(t,
-			affinityKeyFromBody(turn("you are helpful", "question A")),
-			affinityKeyFromBody(turn("you are helpful", "question B")),
+			affinityKeyFromBody(turn("you are helpful", "question A"), false),
+			affinityKeyFromBody(turn("you are helpful", "question B"), false),
 			"a shared system prompt must not collapse every conversation onto one peer")
 	})
 
@@ -57,8 +57,8 @@ func TestAffinityKeyFromBody(t *testing.T) {
 	// still producing a healthy-looking stream of affinity hits. Keying on the
 	// first user message trades a rare harmless collision for immunity to that.
 	t.Run("volatile system prompt does not move the conversation", func(t *testing.T) {
-		k1 := affinityKeyFromBody(turn("today is 2026-09-18T19:04:11Z cwd=/a", "start work"))
-		k2 := affinityKeyFromBody(turn("today is 2026-09-18T19:07:52Z cwd=/b", "start work"))
+		k1 := affinityKeyFromBody(turn("today is 2026-09-18T19:04:11Z cwd=/a", "start work"), false)
+		k2 := affinityKeyFromBody(turn("today is 2026-09-18T19:07:52Z cwd=/b", "start work"), false)
 		assert.Equal(t, k1, k2,
 			"a timestamped system prompt must not rehash the conversation every turn")
 	})
@@ -72,15 +72,15 @@ func TestAffinityKeyFromBody(t *testing.T) {
 		huge := strings.Repeat("x", 64*1024)
 		seen := map[string]bool{}
 		for i := 0; i < 20; i++ {
-			seen[affinityKeyFromBody(turn(huge, fmt.Sprintf("conversation %d", i)))] = true
+			seen[affinityKeyFromBody(turn(huge, fmt.Sprintf("conversation %d", i)), false)] = true
 		}
 		assert.Len(t, seen, 20, "distinct conversations collapsed to %d keys", len(seen))
 	})
 
 	t.Run("a huge first user message is not truncated into a collision", func(t *testing.T) {
 		big := strings.Repeat("y", 200*1024)
-		a := affinityKeyFromBody(turn("sys", big+"ending A"))
-		b := affinityKeyFromBody(turn("sys", big+"ending B"))
+		a := affinityKeyFromBody(turn("sys", big+"ending A"), false)
+		b := affinityKeyFromBody(turn("sys", big+"ending B"), false)
 		assert.NotEqual(t, a, b, "the distinguishing bytes must survive, wherever they sit")
 	})
 
@@ -96,19 +96,19 @@ func TestAffinityKeyFromBody(t *testing.T) {
 			"assistant only":   []byte(`{"model":"m","messages":[{"role":"assistant","content":"hi"}]}`),
 			"messages not arr": []byte(`{"model":"m","messages":"nope"}`),
 		} {
-			assert.Empty(t, affinityKeyFromBody(body), "case %q", name)
+			assert.Empty(t, affinityKeyFromBody(body, false), "case %q", name)
 		}
 	})
 
 	t.Run("completions prompt is a usable seed", func(t *testing.T) {
-		k := affinityKeyFromBody([]byte(`{"model":"m","prompt":"once upon a time"}`))
+		k := affinityKeyFromBody([]byte(`{"model":"m","prompt":"once upon a time"}`), true)
 		assert.NotEmpty(t, k)
-		assert.NotEqual(t, k, affinityKeyFromBody([]byte(`{"model":"m","prompt":"different"}`)))
+		assert.NotEqual(t, k, affinityKeyFromBody([]byte(`{"model":"m","prompt":"different"}`), true))
 	})
 
 	t.Run("multimodal content keys without being a string", func(t *testing.T) {
 		body := []byte(`{"model":"m","messages":[{"role":"user","content":[{"type":"text","text":"describe"},{"type":"image_url","image_url":{"url":"data:x"}}]}]}`)
-		assert.NotEmpty(t, affinityKeyFromBody(body),
+		assert.NotEmpty(t, affinityKeyFromBody(body, false),
 			"content as an array must still produce a seed")
 	})
 }
@@ -119,27 +119,56 @@ func TestAffinityKeyFromRequest(t *testing.T) {
 	hdr.Set("X-Session-Id", "sess-42")
 
 	t.Run("header overrides the body when configured", func(t *testing.T) {
-		a := affinityConfig{headers: []string{"X-Session-Id"}}
-		assert.NotEqual(t, affinityKeyFromBody(body), a.affinityKeyFromRequest(hdr, body))
+		a := affinityConfig{headers: []string{"X-Session-Id"}, minBodyBytes: -1}
+		assert.NotEqual(t, affinityKeyFromBody(body, false), a.affinityKeyFromRequest(hdr, body))
 	})
 
 	t.Run("two requests with the same session id share a key", func(t *testing.T) {
-		a := affinityConfig{headers: []string{"X-Session-Id"}}
+		a := affinityConfig{headers: []string{"X-Session-Id"}, minBodyBytes: -1}
 		other := turn("sys", "a completely different opener")
 		assert.Equal(t, a.affinityKeyFromRequest(hdr, body), a.affinityKeyFromRequest(hdr, other))
 	})
 
 	t.Run("falls back to the body when the header is absent or blank", func(t *testing.T) {
-		a := affinityConfig{headers: []string{"X-Session-Id"}}
+		a := affinityConfig{headers: []string{"X-Session-Id"}, minBodyBytes: -1}
 		blank := http.Header{}
 		blank.Set("X-Session-Id", "   ")
-		assert.Equal(t, affinityKeyFromBody(body), a.affinityKeyFromRequest(blank, body))
-		assert.Equal(t, affinityKeyFromBody(body), a.affinityKeyFromRequest(http.Header{}, body))
+		assert.Equal(t, affinityKeyFromBody(body, false), a.affinityKeyFromRequest(blank, body))
+		assert.Equal(t, affinityKeyFromBody(body, false), a.affinityKeyFromRequest(http.Header{}, body))
+	})
+
+	// A small request has no prefix worth preserving, so binding it to a peer pays
+	// the rank distortion for nothing. A growing conversation crosses the floor
+	// once and is bound from then on. (astra, PR #38 pass 2.)
+	t.Run("bodies under the floor get no key", func(t *testing.T) {
+		a := affinityConfig{minBodyBytes: 2048}
+		small := turn("sys", "hi")
+		require.Less(t, len(small), 2048)
+		assert.Empty(t, a.affinityKeyFromRequest(http.Header{}, small))
+
+		big := turn("sys", strings.Repeat("z", 4096))
+		require.Greater(t, len(big), 2048)
+		assert.NotEmpty(t, a.affinityKeyFromRequest(http.Header{}, big),
+			"a conversation that has grown past the floor must bind")
+	})
+
+	t.Run("an explicit session id beats the floor", func(t *testing.T) {
+		// The client has said these requests belong together; size is irrelevant.
+		a := affinityConfig{headers: []string{"X-Session-Id"}, minBodyBytes: 1 << 20}
+		assert.NotEmpty(t, a.affinityKeyFromRequest(hdr, turn("sys", "hi")))
+	})
+
+	// A FIM prompt changes on every keystroke, so keying single-shot completions
+	// turns least-loaded into hash-random placement — bounded, but pure loss.
+	t.Run("single-shot completions are not keyed unless opted in", func(t *testing.T) {
+		body := []byte(`{"model":"m","prompt":"` + strings.Repeat("p", 4096) + `"}`)
+		assert.Empty(t, affinityKeyFromBody(body, false))
+		assert.NotEmpty(t, affinityKeyFromBody(body, true))
 	})
 
 	t.Run("unconfigured headers are ignored", func(t *testing.T) {
-		assert.Equal(t, affinityKeyFromBody(body),
-			affinityConfig{}.affinityKeyFromRequest(hdr, body))
+		assert.Equal(t, affinityKeyFromBody(body, false),
+			affinityConfig{minBodyBytes: -1}.affinityKeyFromRequest(hdr, body))
 	})
 }
 
@@ -151,7 +180,7 @@ func TestAffinityKeyFromRequest(t *testing.T) {
 // visibly. So the expectation is hard-coded, not recomputed from the code under
 // test: a self-inverting assertion would pass against any implementation.
 func TestAffinityHashIsPinned(t *testing.T) {
-	key := affinityKeyFromBody(turn("you are helpful", "explain rendezvous hashing"))
+	key := affinityKeyFromBody(turn("you are helpful", "explain rendezvous hashing"), false)
 	assert.Equal(t, "f97f9b94900dc5dec6c03bf38ed083f4e89917af3136ef887c65541422ee0297", hex.EncodeToString([]byte(key)),
 		"conversation-seed hashing changed: a mixed-version fleet will disagree about "+
 			"which peer owns a conversation, flushing every prompt cache")
@@ -175,7 +204,7 @@ func affinityTestProxy(t *testing.T, bonus int) (*PeerProxy, map[string]*peerPro
 		logger:      testLogger,
 		admission:   newPeerAdmission(0, 0, []string{"a", "b", "c"}),
 	}
-	p.setAffinity(true, bonus, nil)
+	p.setAffinity(config.PeerAffinityConfig{Enabled: true, Bonus: bonus, MinBodyBytes: -1})
 	return p, map[string]*peerProxyMember{"a": a, "b": b, "c": c}
 }
 
@@ -226,11 +255,44 @@ func TestAffinityRouting(t *testing.T) {
 			"must fall back rather than pile onto a saturated GPU")
 	})
 
-	t.Run("never routes to an unreachable peer for cache locality", func(t *testing.T) {
-		p, m := affinityTestProxy(t, 4)
-		p.loadedCache["c"] = peerLoadedSet{served: map[string]bool{}, fetchedAt: time.Now()}
-		assert.NotEqual(t, m["c"], p.pickPeerForModelWithAffinity("m", keyToC),
-			"a slow answer beats no answer")
+	// Residency guard. Affinity is a tiebreak among peers that ALREADY hold the
+	// model: a peer with bias != 0 does not have the prompt cache being chased, so
+	// routing there buys a cold load (bias 1), an eviction plus a cold load
+	// (bias 3), or a dead node (bias 6) AND a full prefill anyway.
+	//
+	// Each case uses a bonus large enough that the ordinary rank cannot reject the
+	// affine peer on its own — otherwise the guard is never exercised and can be
+	// deleted with the suite still green, which is exactly how the bias-3 bug got
+	// in. (astra, PR #38 pass 2.)
+	t.Run("never routes for affinity to a peer lacking the model", func(t *testing.T) {
+		now := time.Now()
+		for name, state := range map[string]peerLoadedSet{
+			"vacant": {all: map[string]bool{}, order: nil,
+				served: map[string]bool{"m": true}, fetchedAt: now},
+			"other model resident": {all: map[string]bool{"x": true}, order: []string{"x"},
+				served: map[string]bool{"m": true, "x": true}, fetchedAt: now},
+			"unreachable": {served: map[string]bool{}, fetchedAt: now},
+		} {
+			t.Run(name, func(t *testing.T) {
+				p, m := affinityTestProxy(t, 40) // rank alone cannot reject it
+				p.loadedCache["c"] = state
+				got := p.pickPeerForModelWithAffinity("m", keyToC)
+				assert.NotEqual(t, m["c"], got,
+					"affine peer has no resident model (%s): there is no cache to keep, "+
+						"and going there forces a cold load and a full prefill", name)
+				_, cold, _, _, _ := p.AffinityStats()
+				assert.EqualValues(t, 1, cold)
+			})
+		}
+	})
+
+	t.Run("affinity still applies when the affine peer is the warm one", func(t *testing.T) {
+		// The complement of the guard above: with the model resident, a large
+		// bonus must still elect the affine peer. Without this the guard could be
+		// widened to "never" and every test above would still pass.
+		p, m := affinityTestProxy(t, 40)
+		atomic.StoreInt64(&m["a"].inFlight, 0)
+		assert.Equal(t, m["c"], p.pickPeerForModelWithAffinity("m", keyToC))
 	})
 
 	// Admission is live on the gems (maxInflightPerPeer 4, queueTimeout 10s), so
@@ -242,6 +304,8 @@ func TestAffinityRouting(t *testing.T) {
 		atomic.StoreInt64(&m["c"].inFlight, 2) // at the admission cap
 		got := p.pickPeerForModelWithAffinity("m", keyToC)
 		assert.NotEqual(t, m["c"], got, "would 429 while another peer has room")
+		_, _, capped, _, _ := p.AffinityStats()
+		assert.EqualValues(t, 1, capped)
 	})
 
 	t.Run("still uses the affine peer when every peer is capped", func(t *testing.T) {
@@ -261,7 +325,7 @@ func TestAffinityRouting(t *testing.T) {
 
 	t.Run("disabled is identical to the load-aware pick", func(t *testing.T) {
 		p, _ := affinityTestProxy(t, 4)
-		p.setAffinity(false, 0, nil)
+		p.setAffinity(config.PeerAffinityConfig{Enabled: false, MinBodyBytes: -1})
 		var got []string
 		for i := 0; i < 6; i++ {
 			got = append(got, p.pickPeerForModelWithAffinity("m", keyToC).peerID)
@@ -278,10 +342,12 @@ func TestAffinityRouting(t *testing.T) {
 		atomic.StoreInt64(&m["c"].inFlight, 9)
 		p.pickPeerForModelWithAffinity("m", keyToC) // spill
 		p.pickPeerForModelWithAffinity("m", "")     // no key
-		hits, spills, noKey := p.AffinityStats()
+		hits, cold, capped, busy, noKey := p.AffinityStats()
 		assert.EqualValues(t, 1, hits)
-		assert.EqualValues(t, 1, spills)
+		assert.EqualValues(t, 1, busy, "a discount-exhausted spill must count as busy")
 		assert.EqualValues(t, 1, noKey)
+		assert.EqualValues(t, 0, cold)
+		assert.EqualValues(t, 0, capped)
 	})
 }
 
@@ -338,7 +404,7 @@ func TestAffinityDistributesConversations(t *testing.T) {
 	counts := map[string]int{}
 	const n = 600
 	for i := 0; i < n; i++ {
-		key := affinityKeyFromBody(turn("you are helpful", fmt.Sprintf("conversation %d", i)))
+		key := affinityKeyFromBody(turn("you are helpful", fmt.Sprintf("conversation %d", i)), false)
 		counts[affinePeer(key, candidates).peerID]++
 	}
 	for _, id := range []string{"a", "b", "c"} {
@@ -359,7 +425,7 @@ func TestAffinityIsStableAcrossPools(t *testing.T) {
 		{peerID: "diamond"}, {peerID: "amber"}}
 
 	for i := 0; i < 50; i++ {
-		key := affinityKeyFromBody(turn("sys", fmt.Sprintf("conversation %d", i)))
+		key := affinityKeyFromBody(turn("sys", fmt.Sprintf("conversation %d", i)), false)
 		assert.Equal(t, affinePeer(key, sorted).peerID, affinePeer(key, shuffled).peerID,
 			"two pools disagreed about who owns conversation %d", i)
 	}
@@ -375,7 +441,7 @@ func TestAffinityRemapsOnlyTheLostPeer(t *testing.T) {
 
 	var moved, stayed, wasOpal int
 	for i := 0; i < 400; i++ {
-		key := affinityKeyFromBody(turn("sys", fmt.Sprintf("conversation %d", i)))
+		key := affinityKeyFromBody(turn("sys", fmt.Sprintf("conversation %d", i)), false)
 		before := affinePeer(key, full).peerID
 		after := affinePeer(key, reduced).peerID
 		switch {

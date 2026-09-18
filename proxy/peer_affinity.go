@@ -52,6 +52,17 @@ import (
 // discount is exhausted and the load-aware pick takes over.
 const defaultAffinityBonus = 4
 
+// defaultAffinityMinBodyBytes is the request size below which affinity is not
+// attempted.
+//
+// The claim "reusing a prefix beats prefilling it at any throughput" is only
+// true when the queue wait is shorter than the prefill it saves. That holds
+// comfortably for a 37k-token prefix and not at all for a 400-token prompt with
+// a long decode, which has nothing worth saving and would pay the rank
+// distortion anyway. A body floor separates the two cheaply. A growing
+// conversation crosses it once and is bound from then on. (astra, PR #38 pass 2.)
+const defaultAffinityMinBodyBytes = 2048
+
 // affinityConfig is the resolved runtime setting. Zero value = disabled, which
 // keeps the request path byte-identical to before (same land-dark convention as
 // peer admission and the credit gate).
@@ -62,34 +73,63 @@ type affinityConfig struct {
 	// conversation key when present. An operator escape hatch for clients that do
 	// carry a session id; empty (the default) means body-derived keys only.
 	headers []string
+	// minBodyBytes is the request size below which affinity is not attempted.
+	// A small request has little prefix to reuse, so binding it to a peer pays
+	// the rank distortion for nothing. See defaultAffinityMinBodyBytes.
+	minBodyBytes int
+	// keyCompletions extends affinity to single-shot /v1/completions. Off by
+	// default: a FIM code-completion prompt changes on every keystroke, so each
+	// request gets a fresh key and affinity degenerates from least-loaded into
+	// hash-random placement — measured 108/106/86 over 300 single-shot picks
+	// across three peers. Bounded, but pure loss. (astra, PR #38 pass 2.)
+	keyCompletions bool
 }
 
-// affinityStats counts what affinity actually did, because the difference
-// between "working" and "thrashing" is invisible otherwise: a key that rehashes
-// every turn (a system prompt with an injected timestamp, say) produces a
-// perfectly healthy-looking stream of hits while never reusing a single prefix.
-// Hits rising with prompt-eval time NOT falling is the thrash signature.
+// affinityStats counts what affinity DECIDED. The three spill reasons are kept
+// apart because they are entirely different operational signals: cold means the
+// fleet is not holding the model where conversations want it, capped means
+// admission is the binding constraint, busy means the discount is mistuned.
+//
+// What these counters CANNOT tell you is whether affinity is working. A stable
+// key whose prefix keeps changing underneath it — a volatile system prompt, RAG
+// context injected above the user turn — reads as 100% hits while every request
+// still prefills from scratch. Only the upstream's own
+// usage.prompt_tokens_details.cached_tokens can confirm reuse; these counters
+// tell you where requests WENT, not what they found when they got there.
+// (Distinction drawn by astra, PR #38 review pass 2.)
 type affinityStats struct {
-	hits   atomic.Int64 // affine peer chosen
-	spills atomic.Int64 // affine peer known but too loaded / unreachable / capped
-	noKey  atomic.Int64 // no stable key in the request
+	hits         atomic.Int64 // affine peer chosen
+	spillsCold   atomic.Int64 // affine peer does not hold the model (bias != 0)
+	spillsCapped atomic.Int64 // affine peer at its admission cap, another has room
+	spillsBusy   atomic.Int64 // discount exhausted against a less loaded peer
+	noKey        atomic.Int64 // no stable key in the request
 }
 
-// AffinityStats returns (hits, spills, noKey) for operator visibility.
-func (p *PeerProxy) AffinityStats() (int64, int64, int64) {
-	return p.affinityStats.hits.Load(), p.affinityStats.spills.Load(), p.affinityStats.noKey.Load()
+// AffinityStats returns (hits, spillsCold, spillsCapped, spillsBusy, noKey) for
+// operator visibility.
+func (p *PeerProxy) AffinityStats() (int64, int64, int64, int64, int64) {
+	return p.affinityStats.hits.Load(),
+		p.affinityStats.spillsCold.Load(),
+		p.affinityStats.spillsCapped.Load(),
+		p.affinityStats.spillsBusy.Load(),
+		p.affinityStats.noKey.Load()
 }
 
 // affinityKeyFromRequest prefers an explicit session header when the operator has
 // configured one, falling back to the body-derived conversation seed.
 func (a affinityConfig) affinityKeyFromRequest(header http.Header, body []byte) string {
+	// An explicit session id is authoritative and is honoured at any size: the
+	// client has told us these requests belong together.
 	for _, h := range a.headers {
 		if v := strings.TrimSpace(header.Get(h)); v != "" {
 			sum := sha256.Sum256(append([]byte("h:"), v...))
 			return string(sum[:])
 		}
 	}
-	return affinityKeyFromBody(body)
+	if len(body) < a.minBodyBytes {
+		return ""
+	}
+	return affinityKeyFromBody(body, a.keyCompletions)
 }
 
 // affinityKeyFromBody derives a conversation key from an inference request body.
@@ -102,6 +142,14 @@ func (a affinityConfig) affinityKeyFromRequest(header http.Header, body []byte) 
 //     request with injected volatile context (timestamp, cwd, open files), and a
 //     key that rehashes every turn scatters a conversation across the fleet —
 //     strictly worse than no affinity, because it also looks like it is working.
+//
+// The deeper reason the first user message is the right choice, rather than
+// merely a low-collision one: the key is a literal SUBSTRING OF THE CACHED
+// PREFIX. So key stability and prefix stability are the same property. When RAG
+// context is injected into the first user turn, or a sliding window trims it,
+// the key rehashes — and that is correct, because the prefix genuinely changed
+// and there was no cache left to keep. The key tracks the thing it is standing
+// in for. (astra, PR #38 pass 2.)
 //   - It must not be TRUNCATED anywhere a caller controls the prefix. Capping the
 //     seed and appending the system message first means any client with a system
 //     prompt longer than the cap contributes zero bytes of anything
@@ -110,14 +158,15 @@ func (a affinityConfig) affinityKeyFromRequest(header http.Header, body []byte) 
 //     60s prefill; the cap bought nothing and risked exactly the failure this
 //     feature exists to prevent. (Caught in review by astra, 2026-09-18.)
 //
-// The tradeoff accepted: two conversations that open with the same words share a
-// peer. That is harmless — they merely queue together — whereas volatility and
-// truncation are not.
+// Collisions do occur in practice — canned starter-prompt chips in a chat UI,
+// title/tag-generation sub-requests with a fixed opener — and co-locating them
+// is arguably the right answer rather than a tolerated cost, since those
+// requests really do share a prefix.
 //
 // Returns "" when there is nothing stable to key on, which disables affinity for
 // that request rather than inventing a key: an empty or unparseable body must
 // fall through to the load-aware pick, not collide with every other keyless one.
-func affinityKeyFromBody(body []byte) string {
+func affinityKeyFromBody(body []byte, keyCompletions bool) string {
 	if len(body) == 0 {
 		return ""
 	}
@@ -135,8 +184,9 @@ func affinityKeyFromBody(body []byte) string {
 			return false
 		})
 	}
-	if seed == "" {
-		// /v1/completions and friends: no messages, one prompt.
+	if seed == "" && keyCompletions {
+		// /v1/completions and friends: no messages, one prompt. Opt-in — see
+		// affinityConfig.keyCompletions for why this is off by default.
 		seed, tag = gjson.GetBytes(body, "prompt").Raw, "p:"
 	}
 	if seed == "" {

@@ -200,15 +200,37 @@ func NewPeerProxy(peers config.PeerDictionaryConfig, proxyLogger *LogMonitor) (*
 // admission disabled — the land-dark default.
 // setAffinity enables (or replaces) prompt-cache affinity. Called once at
 // startup from the proxy manager with the operator config, BEFORE any request is
-// served. enabled=false leaves the selection path byte-identical to the
-// load-aware pick — the land-dark default. bonus <= 0 takes the default.
-func (p *PeerProxy) setAffinity(enabled bool, bonus int, headers []string) {
+// served. Enabled=false leaves the selection path byte-identical to the
+// load-aware pick — the land-dark default. Zero-valued fields take defaults.
+//
+// NOTE the bound affinity claims (the chosen peer's ordinary rank never exceeds
+// the best available rank by more than bonus) is PER-POOL. Each pool has its own
+// inFlight counters, so N pools can each independently grant the discount and
+// the fleet-wide in-flight spread is up to N*(bonus/2+1). That is pre-existing
+// for load-aware routing and admission alike, but affinity is the first feature
+// to lean on the bound as a SAFETY property, so it is worth saying out loud.
+// (astra, PR #38 pass 2.)
+func (p *PeerProxy) setAffinity(cfg config.PeerAffinityConfig) {
+	bonus := cfg.Bonus
 	if bonus <= 0 {
 		bonus = defaultAffinityBonus
 	}
-	p.affinity = affinityConfig{enabled: enabled, bonus: int64(bonus), headers: headers}
-	if enabled {
-		p.logger.Infof("peer affinity: ENABLED — a conversation is bound to one peer to keep its prompt prefix warm; rank discount %d (the chosen peer's ordinary rank never exceeds the best by more than this); session headers %v", bonus, headers)
+	minBody := cfg.MinBodyBytes
+	if minBody < 0 {
+		minBody = 0
+	} else if cfg.MinBodyBytes == 0 {
+		minBody = defaultAffinityMinBodyBytes
+	}
+	p.affinity = affinityConfig{
+		enabled:        cfg.Enabled,
+		bonus:          int64(bonus),
+		headers:        cfg.SessionHeaders,
+		minBodyBytes:   minBody,
+		keyCompletions: cfg.KeyCompletions,
+	}
+	if cfg.Enabled {
+		p.logger.Infof("peer affinity: ENABLED — a conversation is bound to one peer that ALREADY holds the model, to keep its prompt prefix warm; rank discount %d, min body %dB, session headers %v, completions %v",
+			bonus, minBody, cfg.SessionHeaders, cfg.KeyCompletions)
 	}
 }
 
@@ -434,22 +456,32 @@ func (p *PeerProxy) pickPeerForModelWithAffinity(modelID, affinityKey string) *p
 	// never exceed the best available rank by more than bonus.
 	if affine != nil {
 		switch {
-		case affineBias >= 6:
-			// Unreachable. Cache locality is not worth routing to a dead node:
-			// that trades a slow answer for no answer.
-			p.affinityStats.spills.Add(1)
+		case affineBias != 0:
+			// The model is not resident on the affine peer, so the prompt cache
+			// this whole mechanism chases DOES NOT EXIST there. Routing to it
+			// anyway buys a cold model load (bias 1), or an eviction plus a cold
+			// load (bias 3), or a dead node (bias 6) — and then a full prefill
+			// regardless. Strictly worse than the load-aware pick on every axis.
+			//
+			// Affinity is a tiebreak among peers that already hold the model, and
+			// nothing more. The guard was `>= 6` until astra measured, on this
+			// branch, that bonus 4 beats bias 3 and elects an eviction (PR #38
+			// review pass 2, 2026-09-18).
+			p.affinityStats.spillsCold.Add(1)
 		case p.admissionSaturated(affine, candidates):
 			// Admission would 429 this peer while another has a free slot. Feeding
 			// a saturated peer for cache locality turns a slow answer into a
 			// refused one. (Raised in review by astra, 2026-09-18 — admission is
 			// live on the gems: maxInflightPerPeer 4, queueTimeout 10s.)
-			p.affinityStats.spills.Add(1)
+			p.affinityStats.spillsCapped.Add(1)
 		case atomic.LoadInt64(&affine.inFlight)*2+affineBias-p.affinity.bonus <= bestKey:
 			atomic.AddInt64(&affine.inFlight, 1)
 			p.affinityStats.hits.Add(1)
 			return affine
 		default:
-			p.affinityStats.spills.Add(1)
+			// The discount is exhausted: the affine peer is enough busier than the
+			// best alternative that the queue wait outweighs the saved prefill.
+			p.affinityStats.spillsBusy.Add(1)
 		}
 	}
 
@@ -462,20 +494,26 @@ func (p *PeerProxy) pickPeerForModelWithAffinity(modelID, affinityKey string) *p
 // admissionSaturated reports whether routing to pp for affinity would hand a
 // request to a peer that admission control is about to reject while some other
 // candidate still has room. inFlight (the ranking counter) is not the admission
-// semaphore itself, so this is an approximation — but it is the conservative
-// direction: it only ever declines affinity, never grants it.
+// semaphore itself, so this is an approximation — but the error only ever runs
+// one way. inFlight is incremented at pick and released after the proxied call
+// returns, and the semaphore is acquired INSIDE that window, so inFlight is
+// always >= the number of semaphore holders. Therefore `other.inFlight < limit`
+// implies that peer genuinely has a free slot (it can never falsely claim room),
+// while `pp.inFlight >= limit` may over-declare saturation (it can only decline
+// affinity). Both counters are per-pool, so this compares like with like.
+// (Argument checked by astra, PR #38 review pass 2.)
 //
 // Called with selectMu held.
 func (p *PeerProxy) admissionSaturated(pp *peerProxyMember, candidates []*peerProxyMember) bool {
 	if !p.admission.enabled() {
 		return false
 	}
-	cap := int64(p.admission.maxInflight)
-	if atomic.LoadInt64(&pp.inFlight) < cap {
+	limit := int64(p.admission.maxInflight)
+	if atomic.LoadInt64(&pp.inFlight) < limit {
 		return false
 	}
 	for _, other := range candidates {
-		if other != pp && atomic.LoadInt64(&other.inFlight) < cap {
+		if other != pp && atomic.LoadInt64(&other.inFlight) < limit {
 			return true
 		}
 	}

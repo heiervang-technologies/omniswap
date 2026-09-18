@@ -170,7 +170,7 @@ func New(proxyConfig config.Config) *ProxyManager {
 	}
 	// Prompt-cache affinity (land-dark: only active when peerAffinity.enabled).
 	if peerProxy != nil && proxyConfig.PeerAffinity.Enabled {
-		peerProxy.setAffinity(true, proxyConfig.PeerAffinity.Bonus, proxyConfig.PeerAffinity.SessionHeaders)
+		peerProxy.setAffinity(proxyConfig.PeerAffinity)
 	}
 
 	// Usage-billing debit pipeline — land-dark: the log is disabled (a no-op) and

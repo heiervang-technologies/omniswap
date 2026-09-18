@@ -150,6 +150,15 @@ type PeerAffinityConfig struct {
 	// as the conversation key when present. An escape hatch for clients that do
 	// carry a session id. Empty (the default) = body-derived keys only.
 	SessionHeaders []string `yaml:"sessionHeaders"`
+	// MinBodyBytes is the request size below which affinity is not attempted,
+	// because a small request has no prefix worth preserving and would pay the
+	// rank distortion for nothing. 0 takes the default (2048); set it negative to
+	// disable the floor entirely.
+	MinBodyBytes int `yaml:"minBodyBytes"`
+	// KeyCompletions extends affinity to single-shot /v1/completions. Default
+	// false: a FIM prompt changes every keystroke, so affinity degenerates into
+	// hash-random placement, which is strictly worse than least-loaded.
+	KeyCompletions bool `yaml:"keyCompletions"`
 }
 
 type HooksConfig struct {
