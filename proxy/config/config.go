@@ -127,6 +127,40 @@ type CreditRate struct {
 	MaxOutputTokens int64 `yaml:"maxOutputTokens"` // model's TRUE hard output max (the worst-case completion)
 }
 
+// PeerAffinityConfig controls prompt-cache affinity in peer routing.
+//
+// Without it, a model that every peer has resident ranks purely by in-flight
+// count, so each request is sent to the peer LEAST likely to hold its prompt
+// prefix — on the gems fleet that is the difference between a 0.30s follow-up
+// and a 59.82s one. With it, a conversation is rendezvous-hashed to one peer and
+// every turn goes there, including turns that entered the fleet through a
+// different pool.
+type PeerAffinityConfig struct {
+	// Enabled turns affinity on. Default false: selection stays byte-identical to
+	// the load-aware pick, so this can be landed dark and switched on per site.
+	Enabled bool `yaml:"enabled"`
+	// Bonus is the rank discount granted to a conversation's peer. Selection ranks
+	// peers by inFlight*2 + bias; the affine peer wins when its rank minus Bonus is
+	// still the best. That bounds the imbalance affinity can create — the chosen
+	// peer's ordinary rank never exceeds the best available rank by more than
+	// Bonus — so one hot conversation can never hold a GPU while others idle.
+	// 0 takes the default (4, i.e. tolerate two extra in-flight requests).
+	Bonus int `yaml:"bonus"`
+	// SessionHeaders are request headers, in priority order, whose value is used
+	// as the conversation key when present. An escape hatch for clients that do
+	// carry a session id. Empty (the default) = body-derived keys only.
+	SessionHeaders []string `yaml:"sessionHeaders"`
+	// MinBodyBytes is the request size below which affinity is not attempted,
+	// because a small request has no prefix worth preserving and would pay the
+	// rank distortion for nothing. 0 takes the default (2048); set it negative to
+	// disable the floor entirely.
+	MinBodyBytes int `yaml:"minBodyBytes"`
+	// KeyCompletions extends affinity to single-shot /v1/completions. Default
+	// false: a FIM prompt changes every keystroke, so affinity degenerates into
+	// hash-random placement, which is strictly worse than least-loaded.
+	KeyCompletions bool `yaml:"keyCompletions"`
+}
+
 type HooksConfig struct {
 	OnStartup HookOnStartup `yaml:"on_startup"`
 }
@@ -196,6 +230,12 @@ type Config struct {
 	// rejected with 429 + Retry-After instead of piling onto a saturated peer
 	// (the baseline 502 + long-tail p99 at saturation).
 	MaxInflightPerPeer int `yaml:"maxInflightPerPeer"`
+
+	// PeerAffinity binds a conversation to one peer so its prompt prefix stays in
+	// that peer's KV/prompt cache across turns. Disabled by default (land-dark) —
+	// peer selection is byte-identical to the load-aware pick until enabled.
+	PeerAffinity PeerAffinityConfig `yaml:"peerAffinity"`
+
 	// QueueTimeout is how long a request waits for a free per-peer slot before it
 	// is rejected (429). A Go duration string (e.g. "2s", "500ms"). Empty (the
 	// default) = reject immediately when the peer is full (no queue wait). Only
