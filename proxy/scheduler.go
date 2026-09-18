@@ -11,12 +11,12 @@ import (
 // This lands the Fitter/Ranker interface plus the gems implementation, INERT:
 // nothing here is wired into the request path yet. pickPeerForModel is
 // unchanged — GemsRanker.Rank reproduces its selection ORDER (parity-tested in
-// scheduler_test.go) so a later stage can drive selection through the interface
+// scheduler_test.go, with prompt-cache affinity OFF; see DECIDE 2) so a later stage can drive selection through the interface
 // without a routing change, behind a canary. snoop-kube's home Fitter/Ranker
 // implement the SAME interface for the heterogeneous home cluster; the two
 // converge at stage 3.
 //
-// Two DECIDEs this lift surfaced, deferred to stage 3 so stage 1 stays strictly
+// Three DECIDEs are open, deferred to stage 3 so stage 1 stays strictly
 // behavior-neutral (see the PR):
 //
 //  1. COMPARATOR. Legacy pickPeerForModel ranks by a WEIGHTED SUM
@@ -29,7 +29,21 @@ import (
 //     admission semaphore sheds overload as 429 rather than by pre-emptive
 //     spill — is the stage-3 call.
 //
-//  2. RANKKEY EXPRESSIVENESS. Gems routing has FOUR states
+//  2. PROMPT-CACHE AFFINITY. Neither comparator has any notion of WHICH PEER
+//     HOLDS A CONVERSATION'S PREFIX, and on a warm fleet that omission dominates
+//     both of them: every bias is 0, the weighted sum collapses to least-loaded,
+//     and each turn is dispatched to the peer least likely to hold its prefix
+//     (measured: 59.82s vs 0.30s for the same 14,422-token prompt). peer_affinity.go
+//     now applies a rank DISCOUNT to the conversation's rendezvous-hashed peer,
+//     ahead of and outside the Ranker. It is deliberately not part of RankKey:
+//     Ranker.Rank(model) has no slot for a per-request key, and the interface is
+//     shared with snoop-kube's home implementation, so widening it here would
+//     break a cross-repo contract before stage 3. If an affinity-aware view is
+//     wanted later, add RankFor(model, key) as an extra method on GemsRanker
+//     rather than to Ranker. Note the parity claim above holds WITH AFFINITY OFF
+//     (the default); with it on, selection may legitimately differ from Rank.
+//
+//  3. RANKKEY EXPRESSIVENESS. Gems routing has FOUR states
 //     (warm / vacant / other-model-resident / unreachable). Warm+Load alone
 //     cannot distinguish vacant from other-resident from dead, so FreeMB is used
 //     here as a COARSE vacancy proxy — no measured VRAM crosses the gems diode

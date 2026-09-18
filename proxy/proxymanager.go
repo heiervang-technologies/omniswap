@@ -168,6 +168,10 @@ func New(proxyConfig config.Config) *ProxyManager {
 		}
 		peerProxy.setAdmission(proxyConfig.MaxInflightPerPeer, queueTimeout)
 	}
+	// Prompt-cache affinity (land-dark: only active when peerAffinity.enabled).
+	if peerProxy != nil && proxyConfig.PeerAffinity.Enabled {
+		peerProxy.setAffinity(true, proxyConfig.PeerAffinity.Bonus, proxyConfig.PeerAffinity.SessionHeaders)
+	}
 
 	// Usage-billing debit pipeline — land-dark: the log is disabled (a no-op) and
 	// the emitter is nil unless DebitLogPath is configured, so there is no writer
@@ -1018,6 +1022,14 @@ func (pm *ProxyManager) proxyInferenceHandler(c *gin.Context) {
 	// only when debit logging is enabled.
 	servedBy := new(string)
 	ctx = context.WithValue(ctx, proxyCtxKey("servedBy"), servedBy)
+	// Prompt-cache affinity key, hashed here because this is where the body is
+	// already in hand (io.ReadAll above) — peer selection must never have to read
+	// the body itself. Empty when affinity is off or the body has no stable seed,
+	// which leaves peer selection exactly as it was. See peer_affinity.go.
+	if pm.peerProxy != nil && pm.peerProxy.affinity.enabled {
+		ctx = context.WithValue(ctx, proxyCtxKey("affinity"),
+			pm.peerProxy.affinity.affinityKeyFromRequest(c.Request.Header, bodyBytes))
+	}
 
 	// Prepaid-credit billing gate: reserve the worst-case cost at admission and
 	// resolve on EVERY exit. Rides enforcing() the way peer admission rides enabled()

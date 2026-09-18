@@ -39,6 +39,14 @@ func newSchedProxy() (*PeerProxy, map[string]*peerProxyMember, *GemsRanker) {
 // GemsRanker.Rank's best candidate is EXACTLY pickPeerForModel's pick, across
 // every scenario the legacy selection is tested on. Rank is called first (it is
 // a pure read); pickPeerForModel then reserves. Same pre-state -> same winner.
+//
+// SCOPE: this asserts parity with prompt-cache affinity OFF, which is the
+// default and what these fixtures construct. Affinity deliberately overrides the
+// rank for a conversation's peer (see peer_affinity.go and DECIDE 2 in
+// scheduler.go), so with it enabled selection may differ from Rank BY DESIGN.
+// Stating that here keeps the parity claim from silently becoming false — the
+// failure mode would be a true-looking comment over a test that no longer covers
+// the live path.
 func TestGemsRanker_ParityWithPickPeerForModel(t *testing.T) {
 	now := time.Now()
 	warm, vacant, other, unreachable := schedFixtures(now)
