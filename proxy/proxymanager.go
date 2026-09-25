@@ -1098,20 +1098,30 @@ func (pm *ProxyManager) proxyOAIPostFormHandler(c *gin.Context) {
 		pinnedPeerID = res.PeerID
 	}
 
+	// Same order as the JSON handler: a pinned peer, else a local model, else a
+	// peer that lists the model. Without the last step a bare model name only
+	// worked on the one node that runs it, so behind a load-balanced front door
+	// (several nodes sharing one hostname) most requests for a model served
+	// elsewhere were rejected even though a peer could serve them.
 	var modelID string
 	var processGroup *ProcessGroup
+	var byNamePeer bool
 	if pinnedPeerID == "" {
-		var found bool
-		modelID, found = pm.config.RealModelName(requestedModel)
-		if !found {
+		localID, found := pm.config.RealModelName(requestedModel)
+		switch {
+		case found:
+			modelID = localID
+			var err error
+			processGroup, err = pm.swapProcessGroup(modelID)
+			if err != nil {
+				pm.sendErrorResponse(c, http.StatusInternalServerError, fmt.Sprintf("error swapping process group: %s", err.Error()))
+				return
+			}
+		case pm.peerProxy != nil && pm.peerProxy.HasPeerModel(requestedModel):
+			modelID = requestedModel
+			byNamePeer = true
+		default:
 			pm.sendErrorResponse(c, http.StatusBadRequest, fmt.Sprintf("could not find real modelID for %s", requestedModel))
-			return
-		}
-
-		var err error
-		processGroup, err = pm.swapProcessGroup(modelID)
-		if err != nil {
-			pm.sendErrorResponse(c, http.StatusInternalServerError, fmt.Sprintf("error swapping process group: %s", err.Error()))
 			return
 		}
 	} else {
@@ -1201,7 +1211,14 @@ func (pm *ProxyManager) proxyOAIPostFormHandler(c *gin.Context) {
 	modifiedReq.ContentLength = int64(requestBuffer.Len())
 
 	// Use the modified request for proxying
-	if pinnedPeerID != "" {
+	if byNamePeer {
+		pm.proxyLogger.Debugf("ProxyManager using ProxyPeer for form model: %s", modelID)
+		if err := pm.peerProxy.ProxyRequest(modelID, c.Writer, modifiedReq); err != nil {
+			pm.sendErrorResponse(c, http.StatusInternalServerError, fmt.Sprintf("error proxying request: %s", err.Error()))
+			pm.proxyLogger.Errorf("Error Proxying Request to peer for model %s", modelID)
+			return
+		}
+	} else if pinnedPeerID != "" {
 		if err := pm.peerProxy.ProxyRequestToPeer(pinnedPeerID, modelID, c.Writer, modifiedReq); err != nil {
 			pm.sendErrorResponse(c, http.StatusInternalServerError, fmt.Sprintf("error proxying request: %s", err.Error()))
 			pm.proxyLogger.Errorf("Error Proxying Request to node %s for model %s", pinnedPeerID, modelID)
