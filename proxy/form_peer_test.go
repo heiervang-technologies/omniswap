@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"sync"
+	"sync/atomic"
 	"testing"
 
 	"github.com/mostlygeek/llama-swap/proxy/config"
@@ -161,4 +162,91 @@ func TestProxyManager_FormHandler_LocalPreferredOverPeer(t *testing.T) {
 	cap.mu.Lock()
 	assert.Equal(t, 0, cap.hits)
 	cap.mu.Unlock()
+}
+
+// By-name dispatch must go through model-based selection: with two peers, only
+// the one listing the model receives the request, and the pick's inFlight
+// reservation is released afterwards — on success and on a failing peer alike.
+func TestProxyManager_FormHandler_TwoPeersModelSelectionAndInFlight(t *testing.T) {
+	cases := []struct {
+		name       string
+		asrStatus  int
+		wantStatus int
+	}{
+		{"success", http.StatusOK, http.StatusOK},
+		{"peer 502", http.StatusBadGateway, http.StatusBadGateway},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var asrHits, llmHits atomic.Int64
+			asr := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				asrHits.Add(1)
+				io.Copy(io.Discard, r.Body)
+				w.WriteHeader(tc.asrStatus)
+				w.Write([]byte(`{"text":"asr"}`))
+			}))
+			defer asr.Close()
+			llm := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				llmHits.Add(1)
+				w.Write([]byte(`{"text":"wrong peer"}`))
+			}))
+			defer llm.Close()
+
+			proxy := New(config.AddDefaultGroupToConfig(config.Config{
+				HealthCheckTimeout: 15,
+				Peers: map[string]config.PeerConfig{
+					"a-llm": {Proxy: llm.URL, ProxyURL: mustURL(llm.URL), Models: []string{"gemma"}},
+					"b-asr": {Proxy: asr.URL, ProxyURL: mustURL(asr.URL), Models: []string{"qwen3-asr"}},
+				},
+				LogLevel: "error",
+			}))
+			defer proxy.StopProcesses(StopWaitForInflightRequest)
+
+			rec := CreateTestResponseRecorder()
+			proxy.ServeHTTP(rec, transcriptionRequest(t, "qwen3-asr", []byte("audio")))
+
+			assert.Equal(t, tc.wantStatus, rec.Code, rec.Body.String())
+			assert.Equal(t, int64(1), asrHits.Load(), "the peer listing the model must receive it")
+			assert.Equal(t, int64(0), llmHits.Load(), "a peer not listing the model must not")
+			for id, m := range proxy.peerProxy.memberByPeer {
+				assert.Equal(t, int64(0), atomic.LoadInt64(&m.inFlight), "inFlight leaked on %s", id)
+			}
+		})
+	}
+}
+
+func TestProxyManager_FormHandler_BodySizeCap(t *testing.T) {
+	const limit = 1 << 20 // 1 MiB, configured
+	cap, srv := newFormPeer(t)
+	proxy := New(config.AddDefaultGroupToConfig(config.Config{
+		HealthCheckTimeout: 15,
+		MaxFormBodyBytes:   limit,
+		Peers: map[string]config.PeerConfig{
+			"speech": {Proxy: srv.URL, ProxyURL: mustURL(srv.URL), Models: []string{"qwen3-asr"}},
+		},
+		LogLevel: "error",
+	}))
+	defer proxy.StopProcesses(StopWaitForInflightRequest)
+
+	under := CreateTestResponseRecorder()
+	proxy.ServeHTTP(under, transcriptionRequest(t, "qwen3-asr", randomBytes(t, limit-4096)))
+	assert.Equal(t, http.StatusOK, under.Code, under.Body.String())
+
+	over := CreateTestResponseRecorder()
+	proxy.ServeHTTP(over, transcriptionRequest(t, "qwen3-asr", randomBytes(t, limit+1)))
+	assert.Equal(t, http.StatusRequestEntityTooLarge, over.Code, over.Body.String())
+	assert.Contains(t, over.Body.String(), "exceeds the 1048576 byte limit")
+
+	cap.mu.Lock()
+	assert.Equal(t, 1, cap.hits, "only the under-cap request may reach the peer")
+	cap.mu.Unlock()
+}
+
+func TestProxyManager_FormHandler_BodySizeCapDefault(t *testing.T) {
+	pm := &ProxyManager{config: config.Config{}}
+	assert.Equal(t, int64(100<<20), pm.maxFormBodyBytes())
+	pm.config.MaxFormBodyBytes = -1
+	assert.Equal(t, int64(100<<20), pm.maxFormBodyBytes())
+	pm.config.MaxFormBodyBytes = 5
+	assert.Equal(t, int64(5), pm.maxFormBodyBytes())
 }

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/base64"
+	"errors"
 	"fmt"
 	"io"
 	"mime/multipart"
@@ -1071,9 +1072,30 @@ func (pm *ProxyManager) proxyInferenceHandler(c *gin.Context) {
 	}
 }
 
+// defaultMaxFormBodyBytes bounds a multipart upload when the config leaves
+// maxFormBodyBytes unset. Anything past the 32 MiB in-memory part of
+// ParseMultipartForm spills to temp disk, so without a cap one request can fill
+// the disk.
+const defaultMaxFormBodyBytes int64 = 100 << 20
+
+func (pm *ProxyManager) maxFormBodyBytes() int64 {
+	if pm.config.MaxFormBodyBytes > 0 {
+		return pm.config.MaxFormBodyBytes
+	}
+	return defaultMaxFormBodyBytes
+}
+
 func (pm *ProxyManager) proxyOAIPostFormHandler(c *gin.Context) {
+	limit := pm.maxFormBodyBytes()
+	c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, limit)
+
 	// Parse multipart form
 	if err := c.Request.ParseMultipartForm(32 << 20); err != nil { // 32MB max memory, larger files go to tmp disk
+		var tooBig *http.MaxBytesError
+		if errors.As(err, &tooBig) {
+			pm.sendErrorResponse(c, http.StatusRequestEntityTooLarge, fmt.Sprintf("request body exceeds the %d byte limit for form uploads", limit))
+			return
+		}
 		pm.sendErrorResponse(c, http.StatusBadRequest, fmt.Sprintf("error parsing multipart form: %s", err.Error()))
 		return
 	}
