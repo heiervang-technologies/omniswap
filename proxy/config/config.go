@@ -231,6 +231,11 @@ type Config struct {
 	// (the baseline 502 + long-tail p99 at saturation).
 	MaxInflightPerPeer int `yaml:"maxInflightPerPeer"`
 
+	// MaxFormBodyBytes caps a multipart (form) request body — the
+	// /v1/audio/transcriptions upload — before it is parsed. Larger bodies get
+	// 413 without being read further. 0 (or negative) = the default, 100 MiB.
+	MaxFormBodyBytes int64 `yaml:"maxFormBodyBytes"`
+
 	// PeerAffinity binds a conversation to one peer so its prompt prefix stays in
 	// that peer's KV/prompt cache across turns. Disabled by default (land-dark) —
 	// peer selection is byte-identical to the load-aware pick until enabled.
