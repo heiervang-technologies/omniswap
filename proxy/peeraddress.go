@@ -458,16 +458,35 @@ func (p *PeerProxy) peerLoaded(peerID string, peer config.PeerConfig) peerLoaded
 			return cached // keep the stale snapshot for one more cycle
 		}
 		empty := peerLoadedSet{all: map[string]bool{}, served: map[string]bool{}, fetchedAt: time.Now()}
+		withDeclaredModalities(&empty, peer)
 		p.loadedMu.Lock()
 		p.loadedCache[peerID] = empty
 		p.loadedMu.Unlock()
 		return empty
 	}
 
+	withDeclaredModalities(&snap, peer)
 	p.loadedMu.Lock()
 	p.loadedCache[peerID] = snap
 	p.loadedMu.Unlock()
 	return snap
+}
+
+// withDeclaredModalities fills in the config-declared modality signature for
+// models the peer did not advertise one for (plain vLLM and speech servers
+// send no `architecture` block). An advertised signature is never overridden.
+func withDeclaredModalities(set *peerLoadedSet, peer config.PeerConfig) {
+	if len(peer.Modalities) == 0 {
+		return
+	}
+	if set.modalities == nil {
+		set.modalities = map[string]modelModality{}
+	}
+	for id, d := range peer.Modalities {
+		if _, advertised := set.modalities[id]; !advertised {
+			set.modalities[id] = modelModality{Input: d.Input, Output: d.Output}
+		}
+	}
 }
 
 // fetchPeerLoaded queries one peer's /v1/models and extracts the loaded set.
