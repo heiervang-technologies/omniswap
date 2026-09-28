@@ -380,6 +380,21 @@ peers:
       - model_a
       - model_b
       - embeddings/model_c
+  speech-peer:
+    # a plain vLLM server: its /v1/models has no `architecture` block
+    proxy: http://192.168.1.24:8000
+    models:
+      - qwen3-asr
+      - qwen3-tts
+    # modalities: declare what each model takes in and puts out
+    # - optional, default: empty dictionary
+    # - keys must be listed in models
+    # - only fills a gap: modalities the peer advertises itself always win
+    # - shown on /v1/models (architecture.input_modalities / output_modalities)
+    #   and used by capability addresses such as any[audio]to[text]
+    modalities:
+      qwen3-asr: {input: [audio], output: [text]}
+      qwen3-tts: {input: [text], output: [audio]}
   openrouter:
     proxy: https://openrouter.ai/api
     # apiKey: a string key to be injected into the request
